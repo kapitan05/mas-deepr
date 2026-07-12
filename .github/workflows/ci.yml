@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-type-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check .
+
+      - name: Type check (mypy)
+        run: uv run mypy .
+
+      - name: Test (pytest)
+        run: uv run pytest tests/ -v
+
+      - name: Import + CLI smoke test
+        run: |
+          uv run python -c "
+          import mas_deepr, mas_deepr.config, mas_deepr.telemetry, mas_deepr.llm
+          import mas_deepr.tools, mas_deepr.prompts, mas_deepr.agents
+          import mas_deepr.data, mas_deepr.evals, mas_deepr.optimize
+          print('all modules import cleanly')
+          "
+          uv run python scripts/run_baseline.py --help > /dev/null
+          uv run python scripts/run_milestone_eval.py --help > /dev/null
+          uv run python scripts/compile_dspy.py --help > /dev/null
