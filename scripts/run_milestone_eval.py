@@ -28,7 +28,10 @@ from mas_deepr.data import (
     write_manifest,
 )
 from mas_deepr.evals import JudgeClient, bootstrap_ci, run_benchmark, write_results
+from mas_deepr.prompts import has_compiled_prompt
 from mas_deepr.telemetry import TelemetryTracker, summarize
+
+_ROLES = ("manager", "browser", "synthesizer")
 
 _BENCHMARK_LOADERS = {
     "frames": load_frames,
@@ -52,6 +55,14 @@ async def _run_one(
     )
 
     prefer_compiled = milestone != "baseline"
+    if prefer_compiled and not all(has_compiled_prompt(role) for role in _ROLES):
+        missing = [role for role in _ROLES if not has_compiled_prompt(role)]
+        raise FileNotFoundError(
+            f"--milestone {milestone} requires compiled prompts, but none exist "
+            f"for role(s) {missing} -- run scripts/compile_dspy.py first. "
+            "Silently falling back to hand-written prompts would make this "
+            "milestone indistinguishable from 'baseline'."
+        )
     pipeline = build_pipeline(
         spec=spec, settings=settings, tracker=tracker, prefer_compiled=prefer_compiled
     )
@@ -75,7 +86,10 @@ async def _run_one(
     )
     write_results(records, out_dir / f"{benchmark}_results.parquet")
 
-    mean, lo, hi = bootstrap_ci([r.score for r in records])
+    # Exclude infra-error records from the accuracy CI -- an endpoint outage
+    # or judge parse crash isn't a wrong answer; n_errors below still makes a
+    # high-error run visible instead of silently dragging the mean down.
+    mean, lo, hi = bootstrap_ci([r.score for r in records if r.error is None])
     return pl.DataFrame(
         [
             {

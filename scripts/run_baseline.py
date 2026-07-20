@@ -64,7 +64,11 @@ async def main() -> None:
         max_tool_calls_per_query=settings.max_tool_calls_per_query,
     )
 
-    scores = [r.score for r in records]
+    # CI is computed over non-error records only -- an infra hiccup (endpoint
+    # outage, judge parse crash) isn't a wrong answer and shouldn't silently
+    # drag the accuracy estimate toward 0; n_errors is still reported so a
+    # run with many infra failures doesn't read as a clean high score either.
+    scores = [r.score for r in records if r.error is None]
     mean, lo, hi = bootstrap_ci(scores)
     n_errors = sum(1 for r in records if r.error)
     print(
