@@ -1,5 +1,6 @@
 """Page-fetch tool: HTTP GET + readability extraction, cached and retried."""
 
+import asyncio
 from typing import Annotated
 
 import httpx
@@ -43,9 +44,11 @@ async def fetch_page(
 ) -> str:
     """Fetch a URL and return cleaned main-content text, truncated to ``max_chars``.
 
-    Cached indefinitely by URL. Extraction failures (paywalls, non-HTML
-    content, etc.) return an empty-content marker rather than raising, so a
-    single bad URL doesn't abort the agent loop.
+    Successful extractions are cached indefinitely by URL. Failures
+    (paywalls, non-HTML content, timeouts, etc.) return an empty-content
+    marker rather than raising, so a single bad URL doesn't abort the agent
+    loop -- but failures are never cached, since a transient error must not
+    permanently poison the reproducibility cache.
     """
     cache_key = cache.make_key("fetch", url=url)
     cached = cache.get(cache_key)
@@ -54,10 +57,10 @@ async def fetch_page(
         return text
 
     try:
-        html = _http_get(url, timeout_s)
+        html = await asyncio.to_thread(_http_get, url, timeout_s)
         extracted = trafilatura.extract(html, favor_recall=True) or ""
     except Exception as e:
-        extracted = f"[fetch_failed: {type(e).__name__}: {e}]"
+        return f"[fetch_failed: {type(e).__name__}: {e}]"[:max_chars]
 
     text = extracted[:max_chars]
     cache.set(cache_key, "fetch", {"text": text})

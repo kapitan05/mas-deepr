@@ -6,6 +6,7 @@ it; the docstring and type hints below become the tool's JSON schema, so
 keep them precise -- the SLM reads them to decide how to call this.
 """
 
+import asyncio
 from typing import Annotated, Any
 
 from agent_framework import FunctionTool, tool
@@ -18,10 +19,6 @@ from tenacity import (
 )
 
 from mas_deepr.tools.cache import WebCache
-
-
-class SearchResult(dict[str, Any]):
-    """A single search hit: {title, url, snippet}."""
 
 
 @retry(
@@ -59,7 +56,7 @@ async def web_search(
         return hits
 
     client = TavilyClient(api_key=api_key)
-    raw = _tavily_search(client, query, max_results)
+    raw = await asyncio.to_thread(_tavily_search, client, query, max_results)
     hits = [
         {
             "title": r.get("title", ""),
