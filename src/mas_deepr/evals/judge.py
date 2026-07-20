@@ -86,8 +86,10 @@ class JudgeClient:
             question=question, correct_answer=correct_answer, response=response
         )
         out = await self._run(prompt, question_id=question_id)
-        match = re.search(r"correct:\s*(yes|no)", out.lower())
-        return bool(match and match.group(1) == "yes")
+        # Last match, not first: the grader template's verdict line comes
+        # after ``reasoning``, which could itself echo the word "correct:".
+        matches = re.findall(r"correct:\s*(yes|no)", out.lower())
+        return bool(matches and matches[-1] == "yes")
 
     async def grade_research_rubrics(
         self,

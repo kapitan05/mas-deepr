@@ -98,25 +98,29 @@ async def run_benchmark(
 
     async def _one(question: Question) -> EvalRecord:
         async with semaphore:
-            try:
-                result = await run_pipeline(
-                    pipeline,
-                    question.prompt,
-                    question_id=question.question_id,
-                    max_sub_queries=max_sub_queries,
-                    max_tool_calls_per_query=max_tool_calls_per_query,
-                )
-                record = await _grade(question, result.final_answer, judge)
-                record.sub_questions = result.sub_questions
-                return record
-            except Exception as e:
-                return EvalRecord(
-                    question_id=question.question_id,
-                    source=question.source,
-                    metric="error",
-                    score=0.0,
-                    error=f"{type(e).__name__}: {e}",
-                )
+            last_error = ""
+            for _attempt in range(2):  # one retry: transient infra hiccups
+                # shouldn't cost a question a hard 0 in a milestone score.
+                try:
+                    result = await run_pipeline(
+                        pipeline,
+                        question.prompt,
+                        question_id=question.question_id,
+                        max_sub_queries=max_sub_queries,
+                        max_tool_calls_per_query=max_tool_calls_per_query,
+                    )
+                    record = await _grade(question, result.final_answer, judge)
+                    record.sub_questions = result.sub_questions
+                    return record
+                except Exception as e:
+                    last_error = f"{type(e).__name__}: {e}"
+            return EvalRecord(
+                question_id=question.question_id,
+                source=question.source,
+                metric="error",
+                score=0.0,
+                error=last_error,
+            )
 
     return await asyncio.gather(*[_one(q) for q in questions])
 
