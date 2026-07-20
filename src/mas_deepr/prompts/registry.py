@@ -27,6 +27,11 @@ def _path_for(role: str, *, compiled: bool) -> Path:
     return _TEMPLATES_DIR / f"{role}{suffix}"
 
 
+def has_compiled_prompt(role: str) -> bool:
+    """Whether a DSPy-compiled variant exists for ``role``."""
+    return _path_for(role, compiled=True).exists()
+
+
 def load_prompt(role: str, *, prefer_compiled: bool = False) -> PromptTemplate:
     """Load a role's prompt, optionally preferring a DSPy-compiled variant."""
     if prefer_compiled and _path_for(role, compiled=True).exists():
