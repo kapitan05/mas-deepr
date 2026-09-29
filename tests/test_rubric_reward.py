@@ -8,6 +8,7 @@ import pytest
 from mas_deepr.data.schema import RubricCriterion
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.rl.rubric_reward import (
+    apply_reward_shaping,
     group_advantages,
     prune_zero_variance_rubrics,
     score_rollout_group,
@@ -111,3 +112,63 @@ async def test_score_rollout_group_verifiable_empty_rollouts() -> None:
         prompt="p", question_id="q1", gold_answer="Paris", aliases=[], rollouts=[]
     )
     assert outcomes == []
+
+
+def test_apply_reward_shaping_no_penalties_when_disabled_effectively() -> None:
+    """Zero-weight/false-flag inputs must be a no-op -- the byte-identical-
+    unless-turned-on guarantee rollout_fn's docstring promises."""
+    shaped, components = apply_reward_shaping(
+        base_score=0.8,
+        num_role_turns=3,
+        is_hallucinating=False,
+        turn_penalty_weight=0.03,
+        hallucination_penalty_weight=0.15,
+    )
+    assert shaped == pytest.approx(0.8)
+    assert components["reward/turn_penalty"] == 0.0
+    assert components["reward/hallucination_penalty"] == 0.0
+    assert components["reward/base"] == 0.8
+    assert components["reward/shaped"] == pytest.approx(0.8)
+
+
+def test_apply_reward_shaping_turn_penalty_only_bites_past_three_turns() -> None:
+    shaped_at_floor, _ = apply_reward_shaping(
+        base_score=0.8,
+        num_role_turns=3,
+        is_hallucinating=False,
+        turn_penalty_weight=0.03,
+        hallucination_penalty_weight=0.15,
+    )
+    shaped_over, components = apply_reward_shaping(
+        base_score=0.8,
+        num_role_turns=5,
+        is_hallucinating=False,
+        turn_penalty_weight=0.03,
+        hallucination_penalty_weight=0.15,
+    )
+    assert shaped_at_floor == pytest.approx(0.8)
+    assert shaped_over == pytest.approx(0.8 - 0.03 * 2)
+    assert components["reward/turn_penalty"] == pytest.approx(0.06)
+
+
+def test_apply_reward_shaping_hallucination_penalty() -> None:
+    shaped, components = apply_reward_shaping(
+        base_score=0.8,
+        num_role_turns=3,
+        is_hallucinating=True,
+        turn_penalty_weight=0.03,
+        hallucination_penalty_weight=0.15,
+    )
+    assert shaped == pytest.approx(0.8 - 0.15)
+    assert components["reward/hallucination_penalty"] == 0.15
+
+
+def test_apply_reward_shaping_clamped_at_zero_not_negative() -> None:
+    shaped, _ = apply_reward_shaping(
+        base_score=0.1,
+        num_role_turns=10,
+        is_hallucinating=True,
+        turn_penalty_weight=0.03,
+        hallucination_penalty_weight=0.15,
+    )
+    assert shaped == 0.0

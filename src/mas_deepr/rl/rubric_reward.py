@@ -106,6 +106,46 @@ def prune_zero_variance_rubrics(
     return keep
 
 
+def apply_reward_shaping(
+    *,
+    base_score: float,
+    num_role_turns: int,
+    is_hallucinating: bool,
+    turn_penalty_weight: float,
+    hallucination_penalty_weight: float,
+) -> tuple[float, dict[str, float]]:
+    """Small, additive shaping terms on top of the primary judge/exact-match
+    score -- an optional ablation arm alongside the unshaped baseline
+    reward, not a replacement for it (see ``rl/rollout.py::rollout_fn``'s
+    ``penalize_turns``/``penalize_hallucination`` flags, both default off).
+
+    Weights are meant small (0.02-0.05 for turns, ~0.15 for hallucination --
+    a real fabrication is worse than a slightly-too-long trajectory) so the
+    primary signal still dominates GRPO's group-normalized advantage; these
+    are nudges, not a reward redesign. Turn penalty only bites past 3 role
+    turns (one manager + one browser + one synthesizer call is the
+    irreducible minimum for any answered question, per
+    ``agents/topology.py::run_pipeline`` -- penalizing that floor would
+    penalize every rollout equally regardless of length).
+
+    Returns ``(shaped_score, components)`` so the raw primary score and
+    each shaping term land in ``trajectory.metrics`` separately, not just
+    the final blended number -- the exact instrumentation a reward-hacking
+    spot-check needs (e.g. did the turn penalty just make rollouts
+    truncate early without actually answering better, rather than the
+    LoRA genuinely getting more efficient?).
+    """
+    turn_penalty = turn_penalty_weight * max(0, num_role_turns - 3)
+    halluc_penalty = hallucination_penalty_weight if is_hallucinating else 0.0
+    shaped = max(0.0, base_score - turn_penalty - halluc_penalty)
+    return shaped, {
+        "reward/base": base_score,
+        "reward/turn_penalty": turn_penalty,
+        "reward/hallucination_penalty": halluc_penalty,
+        "reward/shaped": shaped,
+    }
+
+
 def group_advantages(scores: list[float]) -> list[float]:
     """GRPO's group-normalized advantage: ``A_i = (r_i - mean) / std``.
 

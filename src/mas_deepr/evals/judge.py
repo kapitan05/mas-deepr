@@ -52,6 +52,22 @@ form: [{"index": 0, "satisfied": true}, {"index": 1, "satisfied": false}, ...]
 No prose before or after the JSON.
 """.strip()
 
+_HALLUCINATION_JUDGE_INSTRUCTIONS = """
+You are a strict fact-checker. You will be given a research question, the
+evidence an assistant gathered while researching it (its "findings"), and
+the assistant's final answer. Decide whether the final answer asserts any
+concrete claim (a fact, number, name, date, or quote) that is NOT supported
+by the findings -- i.e. the assistant made something up rather than basing
+its answer on what it actually found.
+
+Respond with ONLY a JSON object in this exact form:
+{"hallucinated": true} or {"hallucinated": false}
+No prose before or after the JSON. If the findings are too sparse to judge
+either way, answer {"hallucinated": false} -- absence of evidence for a
+claim is not the same as evidence the claim is fabricated, and this check
+should only catch clear, checkable fabrication.
+""".strip()
+
 
 class JudgeClient:
     """Wraps a frontier judge model behind the same Agent/telemetry pattern
@@ -121,6 +137,35 @@ class JudgeClient:
             for r, v in zip(rubrics, verdicts, strict=True)
         ]
 
+    async def grade_hallucination(
+        self,
+        *,
+        question: str,
+        findings: list[str],
+        response: str,
+        question_id: str,
+    ) -> bool:
+        """Cheap, reusable fabrication check for GRPO reward shaping
+        (``rl/rubric_reward.py::apply_reward_shaping``) -- same judge client
+        already configured for the rollout (no new provider, billed the
+        same way as every other judge call). Deliberately conservative:
+        defaults to "not hallucinating" both when the judge says so AND
+        when its response fails to parse -- a judge hiccup must not
+        silently zero out a rollout's reward via the shaping penalty (see
+        ``_parse_hallucination_verdict``).
+        """
+        findings_block = (
+            "\n".join(f"- {f}" for f in findings) if findings else "(no findings)"
+        )
+        judge_prompt = (
+            f"{_HALLUCINATION_JUDGE_INSTRUCTIONS}\n\n"
+            f"Question: {question}\n\n"
+            f"Findings:\n{findings_block}\n\n"
+            f"Final answer: {response}"
+        )
+        out = await self._run(judge_prompt, question_id=question_id)
+        return _parse_hallucination_verdict(out)
+
 
 def _weighted_rubric_score(
     rubrics: list[RubricCriterion], verdicts: list[bool]
@@ -167,3 +212,20 @@ def _parse_rubric_verdicts(raw: str, *, num_criteria: int) -> list[bool]:
         if isinstance(idx, int) and 0 <= idx < num_criteria:
             verdicts[idx] = bool(item.get("satisfied", False))
     return verdicts
+
+
+def _parse_hallucination_verdict(raw: str) -> bool:
+    """Parse ``{"hallucinated": bool}``; default to False (not hallucinating)
+    on any parse failure -- same "default-safe" shape as
+    ``_parse_rubric_verdicts``, but the safe default here is specifically
+    "don't penalize" rather than "don't credit": a garbled judge response
+    must not silently tank a rollout's reward through the shaping penalty.
+    """
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return False
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return False
+    return bool(parsed.get("hallucinated", False))

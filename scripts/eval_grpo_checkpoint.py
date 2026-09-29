@@ -78,7 +78,12 @@ async def main() -> None:
     from art.serverless.backend import ServerlessBackend
 
     model: art.TrainableModel = art.TrainableModel(
-        name=args.model_name, project=args.project, base_model=args.base_model
+        name=args.model_name,
+        # Same convention as train_grpo.py -- required as of openpipe-art
+        # 0.5.20, see that file's comment on the same kwarg.
+        run_name=args.model_name,
+        project=args.project,
+        base_model=args.base_model,
     )
     backend = ServerlessBackend()
     await model.register(backend)

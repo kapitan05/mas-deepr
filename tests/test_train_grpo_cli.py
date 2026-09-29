@@ -33,6 +33,7 @@ def _build_parser(module: object) -> argparse.ArgumentParser:
     # structure just to make this testable.
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-model", required=True)
+    parser.add_argument("--model-name", default="mas-deepr-grpo")
     parser.add_argument("--musique-limit", type=int, default=None)
     parser.add_argument("--hotpot-limit", type=int, default=None)
     parser.add_argument("--dr-tulu-limit", type=int, default=None)
@@ -50,6 +51,16 @@ def _build_parser(module: object) -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-exceptions", type=float, default=20)
+    parser.add_argument(
+        "--penalize-turns", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--turn-penalty-weight", type=float, default=0.03)
+    parser.add_argument(
+        "--penalize-hallucination",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--hallucination-penalty-weight", type=float, default=0.15)
     return parser
 
 
@@ -133,3 +144,72 @@ def test_uses_itertools_cycle_for_wraparound_batching() -> None:
     source = _SCRIPT_PATH.read_text()
     assert "itertools.cycle" in source
     assert "rng.shuffle" in source
+
+
+def test_model_name_defaults_to_mas_deepr_grpo() -> None:
+    """Regression guard: existing single-arm behavior (registering/resuming
+    "mas-deepr-grpo") must stay unchanged unless --model-name is passed."""
+    module = _load_train_grpo()
+    parser = _build_parser(module)
+    args = parser.parse_args(["--base-model", "b"])
+    assert args.model_name == "mas-deepr-grpo"
+
+
+def test_model_name_is_overridable_for_a_second_arm() -> None:
+    module = _load_train_grpo()
+    parser = _build_parser(module)
+    args = parser.parse_args(
+        ["--base-model", "b", "--model-name", "mas-deepr-grpo-turns"]
+    )
+    assert args.model_name == "mas-deepr-grpo-turns"
+
+
+def test_no_hardcoded_model_name_left_in_registration_or_wandb_sink() -> None:
+    """Regression guard: TrainableModel(name=...) and WandbSink(run_name=...)
+    must both read args.model_name, not the literal "mas-deepr-grpo" --
+    otherwise every arm would collide on one W&B run/LoRA name regardless
+    of --model-name."""
+    source = _SCRIPT_PATH.read_text()
+    assert "name=args.model_name" in source
+    assert "run_name=args.model_name" in source
+
+
+def test_reward_shaping_flags_default_off() -> None:
+    module = _load_train_grpo()
+    parser = _build_parser(module)
+    args = parser.parse_args(["--base-model", "b"])
+    assert args.penalize_turns is False
+    assert args.penalize_hallucination is False
+    assert args.turn_penalty_weight == 0.03
+    assert args.hallucination_penalty_weight == 0.15
+
+
+def test_reward_shaping_flags_can_be_enabled() -> None:
+    module = _load_train_grpo()
+    parser = _build_parser(module)
+    args = parser.parse_args(
+        [
+            "--base-model",
+            "b",
+            "--penalize-turns",
+            "--penalize-hallucination",
+            "--turn-penalty-weight",
+            "0.05",
+        ]
+    )
+    assert args.penalize_turns is True
+    assert args.penalize_hallucination is True
+    assert args.turn_penalty_weight == 0.05
+
+
+def test_backend_train_result_is_logged_to_wandb() -> None:
+    """Regression test for a real, confirmed bug: backend.train()'s return
+    value (ServerlessTrainResult, carrying reward/policy_loss/entropy/
+    grad_norm/learning_rate) used to be discarded outright -- confirmed
+    live 2026-09-29 that a completed run's W&B page showed no "loss" group
+    at all, only data/time/train/tables (from the separate
+    model.log(trajectory_groups, ...) call). backend.train()'s own
+    docstring says explicitly it does NOT log metrics on its own."""
+    source = _SCRIPT_PATH.read_text()
+    assert "train_result = await backend.train(" in source
+    assert "model.log(metrics=train_result.metrics, step=train_result.step)" in source

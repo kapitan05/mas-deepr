@@ -13,11 +13,26 @@ cost/quota before relying on this for a deadline. See
 ``docs/art-wandb-decision.md``.
 
 Everything possible is reported to one W&B run (``project`` =
-``Settings.wandb_project``, ``name`` = the model name):
-  - reward / loss / KL / throughput -- ART logs these automatically
+``Settings.wandb_project``, ``name`` = ``--model-name``):
+  - reward / policy loss / entropy / grad norm / learning rate -- ART
+    computes these server-side every ``backend.train()`` call, but (unlike
+    the trajectory logging below) does NOT log them anywhere on its own --
+    confirmed live 2026-09-29 (a completed run showed no "loss" group in
+    W&B at all). This script now explicitly forwards
+    ``backend.train()``'s own return value via
+    ``model.log(metrics=result.metrics, step=result.step)`` right after
+    training, which is what actually gets ``loss/entropy``, ``loss/train``,
+    ``loss/grad_norm``, ``loss/learning_rate`` onto the run (NOT
+    ``loss/kl_div``/``loss/kl_policy_ref`` -- those need
+    ``kl_penalty_coef`` > 0, which ``ServerlessBackend.train()``'s public
+    signature doesn't expose).
   - GPU / system utilization -- W&B captures these automatically
     (server-side for serverless, local-side for ``--backend local``)
-  - per-rollout trajectory metrics -- via ``model.log(groups, split=...)``
+  - per-rollout trajectory metrics -- via ``model.log(groups, split=...)``,
+    including ``reward/base``/``reward/turn_penalty``/
+    ``reward/hallucination_penalty``/``reward/shaped`` when
+    ``--penalize-turns``/``--penalize-hallucination`` are on (see
+    ``rl/rubric_reward.py::apply_reward_shaping``)
   - a browsable per-rollout summary table -- via ``WandbSink.log_table``
 
 Requires ``uv sync --extra rl-art``. Importing ``art`` monkeypatches
@@ -64,6 +79,18 @@ def _make_backend(kind: str) -> Any:
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-model", required=True)
+    parser.add_argument(
+        "--model-name",
+        default="mas-deepr-grpo",
+        help="ART TrainableModel name -- also the W&B run name. Distinct "
+        "names register independent LoRA adapters on the same base "
+        "weights, so different reward-shaping arms (see --penalize-turns/"
+        "--penalize-hallucination) can share --base-model without "
+        "colliding. Run arms sequentially, not concurrently -- they share "
+        "the same server-side MCP tool rate limits (mcp_backend/"
+        "rate_limit.py), which are already at real capacity for a single "
+        "arm (confirmed live: Semantic Scholar 429s at today's rate).",
+    )
     parser.add_argument("--musique-limit", type=int, default=None)
     parser.add_argument("--hotpot-limit", type=int, default=None)
     parser.add_argument("--dr-tulu-limit", type=int, default=None)
@@ -108,6 +135,24 @@ async def main() -> None:
     parser.add_argument(
         "--backend", choices=("serverless", "local"), default="serverless"
     )
+    parser.add_argument(
+        "--penalize-turns",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Small additive penalty for rollouts using more than the "
+        "3-role-turn floor (manager+browser+synthesizer). Off by default "
+        "-- see rl/rubric_reward.py::apply_reward_shaping.",
+    )
+    parser.add_argument("--turn-penalty-weight", type=float, default=0.03)
+    parser.add_argument(
+        "--penalize-hallucination",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="One extra judge call per rollout (same --judge-model, no new "
+        "provider) checking whether the final answer asserts anything not "
+        "supported by the Browser's findings. Off by default.",
+    )
+    parser.add_argument("--hallucination-penalty-weight", type=float, default=0.15)
     args = parser.parse_args()
 
     configure_logging()
@@ -121,7 +166,13 @@ async def main() -> None:
         )
 
     model: art.TrainableModel[Any, Any] = art.TrainableModel(
-        name="mas-deepr-grpo",
+        name=args.model_name,
+        # Paired with WandbSink(run_name=...) below -- same value, same
+        # convention already established in this script (see
+        # test_train_grpo_cli.py's regression guard). openpipe-art 0.5.20
+        # made this a required kwarg (confirmed live 2026-09-29, was
+        # optional on the 0.5.18 this was originally written against).
+        run_name=args.model_name,
         project=settings.wandb_project,
         base_model=args.base_model,
     )
@@ -163,6 +214,10 @@ async def main() -> None:
             "n_musique": n_musique,
             "n_hotpot": n_hotpot,
             "n_dr_tulu": n_dr_tulu,
+            "penalize_turns": args.penalize_turns,
+            "turn_penalty_weight": args.turn_penalty_weight,
+            "penalize_hallucination": args.penalize_hallucination,
+            "hallucination_penalty_weight": args.hallucination_penalty_weight,
         }
     )
     backend = _make_backend(args.backend)
@@ -195,6 +250,10 @@ async def main() -> None:
                 tool_scope=args.tool_scope,
                 prefer_compiled=args.prefer_compiled,
                 llm_semaphore=llm_semaphore,
+                penalize_turns=args.penalize_turns,
+                turn_penalty_weight=args.turn_penalty_weight,
+                penalize_hallucination=args.penalize_hallucination,
+                hallucination_penalty_weight=args.hallucination_penalty_weight,
             )
             for q in batch
         ]
@@ -218,8 +277,20 @@ async def main() -> None:
             for t in tg.trajectories
         )
 
-        # 3. The gradient step (reward/loss/KL/throughput auto-logged by ART).
-        await backend.train(model, trajectory_groups, learning_rate=args.learning_rate)
+        # 3. The gradient step. backend.train()'s docstring is explicit:
+        # "This method does NOT automatically log trajectories or metrics.
+        # Call model.log() explicitly ... if you want to log data." --
+        # confirmed live 2026-09-29: the W&B run showed no "loss" group at
+        # all (only data/time/train/tables, from the model.log() call
+        # above) because this return value used to be discarded outright.
+        # ServerlessTrainResult.metrics carries reward/policy_loss/entropy/
+        # grad_norm/learning_rate under ART's own key names --
+        # _UPSTREAM_TRAIN_METRIC_KEYS in art/serverless/backend.py maps
+        # these onto "loss/*" W&B keys once actually logged.
+        train_result = await backend.train(
+            model, trajectory_groups, learning_rate=args.learning_rate
+        )
+        await model.log(metrics=train_result.metrics, step=train_result.step)
         step_num = await model.get_step()
         print(
             f"[step {step_idx + 1}/{args.num_steps}] trained on "
@@ -229,7 +300,7 @@ async def main() -> None:
 
     with WandbSink(
         project=settings.wandb_project,
-        run_name="mas-deepr-grpo",
+        run_name=args.model_name,
         disabled=False,
     ) as sink:
         sink.log_table(

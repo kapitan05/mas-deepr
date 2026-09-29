@@ -140,9 +140,17 @@ class Settings(BaseSettings):
     # under ~5 req/s (mediawiki.org/wiki/API:Etiquette). This holds true
     # regardless of how many GRPO rollouts/parallel questions are queued
     # behind it: a token-bucket limiter caps sustained *throughput*, not
-    # concurrency, so queue depth adds latency, not ban risk. Default
-    # leaves real margin below the documented ceiling.
-    wikipedia_rate_per_sec: float = 3.0
+    # concurrency, so queue depth adds latency, not ban risk. Raised from
+    # 3.0 after empirically probing the real MCP server (scripts/
+    # probe_rate_limit.py) live 2026-09-29: 0 failures across 20/40/60-call
+    # bursts at 3, 8, and 15 req/s respectively -- 10 leaves real margin
+    # below the tested-clean ceiling while meaningfully cutting rollout
+    # stall time. (Semantic Scholar's own 0.9 above was tested the same
+    # way and NOT raised -- see its comment: 0.9 is a deliberately-reasoned
+    # value from a direct provider confirmation, not a guess, and the probe
+    # found consistent ~5-7% failure rates at 0.9/1.0/1.2 alike, i.e.
+    # already at real capacity, not scope for improvement via this knob.)
+    wikipedia_rate_per_sec: float = 10.0
     # Tavily's documented Development-tier ceiling is 100 req/min; this
     # leaves margin and matters less in practice since it's off by
     # default -- included for parity/completeness, not because it's the

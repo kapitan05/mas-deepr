@@ -14,8 +14,16 @@ ART-touching tests in their own process: ``uv run pytest tests/ -m art``.
 
 import asyncio
 import time
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    # Type-checking only -- never executes, so this can't trigger the
+    # transformers.masking_utils monkeypatch described above. Needed
+    # because two fake_rollout_fn helpers below annotate their return type
+    # as "art.Trajectory" (a forward-ref string, resolved only by mypy).
+    import art
 
 pytestmark = pytest.mark.art
 
@@ -241,7 +249,10 @@ def _make_model(monkeypatch: pytest.MonkeyPatch) -> object:
     monkeypatch.setattr(
         art.TrainableModel, "get_inference_name", _fake_get_inference_name
     )
-    return art.TrainableModel(name="m", project="p", base_model="b")
+    # run_name required as of openpipe-art 0.5.20 (was optional on 0.5.18
+    # this was originally written against) -- same value as name, matching
+    # train_grpo.py's established convention.
+    return art.TrainableModel(name="m", run_name="m", project="p", base_model="b")
 
 
 def _fake_judge_and_tracker() -> tuple[object, object]:
@@ -451,13 +462,23 @@ async def test_run_rollout_group_runs_rollouts_concurrently(
     in_flight = 0
     max_in_flight = 0
 
-    async def fake_rollout_fn(model: object, question: object, **kwargs: object) -> str:
+    async def fake_rollout_fn(
+        model: object, question: object, **kwargs: object
+    ) -> "art.Trajectory":
+        import art
+
         nonlocal in_flight, max_in_flight
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
         await asyncio.sleep(0.05)
         in_flight -= 1
-        return "trajectory"
+        # A real Trajectory, not a bare string -- openpipe-art 0.5.20's
+        # TrajectoryGroup normalization validates each item strictly
+        # (confirmed live 2026-09-29: a plain str raises a pydantic
+        # ValidationError where the older version tolerated it). Only the
+        # timing/concurrency behavior is under test here, so an
+        # all-defaults Trajectory is enough.
+        return art.Trajectory()
 
     monkeypatch.setattr(rollout_mod, "rollout_fn", fake_rollout_fn)
 
@@ -491,13 +512,18 @@ async def test_run_rollout_group_llm_semaphore_bounds_concurrency(
     in_flight = 0
     max_in_flight = 0
 
-    async def fake_rollout_fn(model: object, question: object, **kwargs: object) -> str:
+    async def fake_rollout_fn(
+        model: object, question: object, **kwargs: object
+    ) -> "art.Trajectory":
+        import art
+
         nonlocal in_flight, max_in_flight
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
         await asyncio.sleep(0.03)
         in_flight -= 1
-        return "trajectory"
+        # See the sibling test above for why a real Trajectory is needed.
+        return art.Trajectory()
 
     monkeypatch.setattr(rollout_mod, "rollout_fn", fake_rollout_fn)
 
@@ -517,3 +543,102 @@ async def test_run_rollout_group_llm_semaphore_bounds_concurrency(
         llm_semaphore=semaphore,
     )
     assert max_in_flight == 2
+
+
+class _FakeJudgeWithHallucinationCheck:
+    """Duck-typed stand-in with just enough surface for the shaping tests
+    below -- grade_hallucination is the only method rollout_fn actually
+    calls when penalize_hallucination=True and the question is verifiable
+    (no rubric grading involved)."""
+
+    def __init__(self, *, hallucinated: bool) -> None:
+        self._hallucinated = hallucinated
+
+    async def grade_hallucination(self, **kwargs: object) -> bool:
+        return self._hallucinated
+
+
+async def _fake_run_pipeline_with_turns(
+    pipeline: object, prompt: str, **kwargs: object
+) -> object:
+    from mas_deepr.agents.topology import AgentTurn, PipelineResult
+
+    turn = AgentTurn(text="x", messages=[])
+    return PipelineResult(
+        question_id=str(kwargs.get("question_id", "")),
+        question=prompt,
+        final_answer="FINAL ANSWER: Paris",
+        findings=["Paris is the capital of France."],
+        role_turns=[("manager", turn)] * 5,  # 5 > the 3-turn no-penalty floor
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollout_fn_applies_reward_shaping_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mas_deepr.data.schema import Question
+    from mas_deepr.rl import rollout as rollout_mod
+
+    monkeypatch.setattr(
+        rollout_mod, "build_pipeline", lambda **kwargs: _RecordingPipeline()
+    )
+    monkeypatch.setattr(rollout_mod, "run_pipeline", _fake_run_pipeline_with_turns)
+
+    model = _make_model(monkeypatch)
+    question = Question(
+        question_id="q1", source="musique", split="train", prompt="p", answer="Paris"
+    )
+    judge = _FakeJudgeWithHallucinationCheck(hallucinated=True)
+    _, tracker = _fake_judge_and_tracker()
+
+    trajectory = await rollout_mod.rollout_fn(
+        model,  # type: ignore[arg-type]
+        question,
+        judge=judge,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+        penalize_turns=True,
+        turn_penalty_weight=0.03,
+        penalize_hallucination=True,
+        hallucination_penalty_weight=0.15,
+    )
+
+    # base score 1.0 (exact match) - turn_penalty (0.03 * (5-3)) - halluc (0.15)
+    assert trajectory.reward == pytest.approx(1.0 - 0.06 - 0.15)
+    assert trajectory.metrics["reward/base"] == 1.0
+    assert trajectory.metrics["reward/turn_penalty"] == pytest.approx(0.06)
+    assert trajectory.metrics["reward/hallucination_penalty"] == 0.15
+
+
+@pytest.mark.asyncio
+async def test_rollout_fn_reward_unshaped_when_flags_default_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: with both shaping flags at their default (off),
+    behavior must be byte-identical to before shaping existed -- raw score,
+    no reward/* metrics added."""
+    from mas_deepr.data.schema import Question
+    from mas_deepr.rl import rollout as rollout_mod
+
+    monkeypatch.setattr(
+        rollout_mod, "build_pipeline", lambda **kwargs: _RecordingPipeline()
+    )
+    monkeypatch.setattr(rollout_mod, "run_pipeline", _fake_run_pipeline_with_turns)
+
+    model = _make_model(monkeypatch)
+    question = Question(
+        question_id="q1", source="musique", split="train", prompt="p", answer="Paris"
+    )
+    # A judge with no grade_hallucination at all -- if rollout_fn ever
+    # called it despite the flag being off, this would raise AttributeError.
+    judge, tracker = _fake_judge_and_tracker()
+
+    trajectory = await rollout_mod.rollout_fn(
+        model,  # type: ignore[arg-type]
+        question,
+        judge=judge,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+    )
+
+    assert trajectory.reward == 1.0
+    assert "reward/base" not in trajectory.metrics

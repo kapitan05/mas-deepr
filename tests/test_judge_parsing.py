@@ -1,5 +1,9 @@
 from mas_deepr.data.schema import RubricCriterion
-from mas_deepr.evals.judge import _parse_rubric_verdicts, _weighted_rubric_score
+from mas_deepr.evals.judge import (
+    _parse_hallucination_verdict,
+    _parse_rubric_verdicts,
+    _weighted_rubric_score,
+)
 
 
 def test_parse_rubric_verdicts_basic() -> None:
@@ -57,3 +61,27 @@ def test_weighted_rubric_score_negative_weight_satisfied_lowers_score() -> None:
 
 def test_weighted_rubric_score_empty_rubrics_does_not_divide_by_zero() -> None:
     assert _weighted_rubric_score([], []) == 0.0
+
+
+def test_parse_hallucination_verdict_true() -> None:
+    assert _parse_hallucination_verdict('{"hallucinated": true}') is True
+
+
+def test_parse_hallucination_verdict_false() -> None:
+    assert _parse_hallucination_verdict('{"hallucinated": false}') is False
+
+
+def test_parse_hallucination_verdict_with_surrounding_prose() -> None:
+    raw = 'My assessment:\n{"hallucinated": true}\nThat is my answer.'
+    assert _parse_hallucination_verdict(raw) is True
+
+
+def test_parse_hallucination_verdict_malformed_defaults_to_not_hallucinating() -> None:
+    """Regression guard: a judge parsing failure must default to False
+    (not hallucinating), never True -- a garbled judge response must not
+    silently zero out a rollout's reward via the shaping penalty."""
+    assert _parse_hallucination_verdict("not json at all") is False
+
+
+def test_parse_hallucination_verdict_missing_key_defaults_false() -> None:
+    assert _parse_hallucination_verdict("{}") is False
