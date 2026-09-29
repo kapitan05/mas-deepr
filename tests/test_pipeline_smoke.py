@@ -91,3 +91,67 @@ async def test_run_pipeline_single_sub_question(tmp_path: Path) -> None:
     result = await run_pipeline(pipeline, "q", question_id="q2")
     assert result.sub_questions == ["Only question?"]
     assert result.final_answer == "Answer"
+
+
+class _FakeMcpClient:
+    """Duck-typed stand-in for MCPToolClient's async-context-manager
+    surface -- records enter/exit calls, doesn't touch a real connection."""
+
+    def __init__(self) -> None:
+        self.enter_count = 0
+        self.exit_count = 0
+
+    async def __aenter__(self) -> "_FakeMcpClient":
+        self.enter_count += 1
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.exit_count += 1
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_holds_mcp_client_open_for_the_whole_run(
+    tmp_path: Path,
+) -> None:
+    """Regression test: run_pipeline used to have no handle on the
+    pipeline's MCPToolClient at all, so every tool call reconnected --
+    confirms it now opens the connection once for the whole run, not once
+    per tool call (there'd be 2 browser calls here if it were per-call)."""
+    manager = _FakeAgent(["1. What is X?\n2. What is Y?"])
+    browser = _FakeAgent(["Finding for X", "Finding for Y"])
+    synthesizer = _FakeAgent(["Final answer combining X and Y"])
+    tracker = TelemetryTracker(tmp_path / "telemetry.jsonl", run_id="mcp", phase="dev")
+    fake_mcp = _FakeMcpClient()
+    pipeline = ResearchPipeline(
+        manager=cast(Agent, manager),
+        browser=cast(Agent, browser),
+        synthesizer=cast(Agent, synthesizer),
+        spec=_SPEC,
+        tracker=tracker,
+        mcp_client=cast(Any, fake_mcp),
+    )
+
+    await run_pipeline(pipeline, "original question", question_id="q3")
+
+    assert fake_mcp.enter_count == 1
+    assert fake_mcp.exit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_with_no_mcp_client_is_unaffected(tmp_path: Path) -> None:
+    """mcp_client=None (every other test in this file) must keep working
+    exactly as before -- no AttributeError, no accidental connection."""
+    manager = _FakeAgent(["1. Only question?"])
+    browser = _FakeAgent(["Only finding"])
+    synthesizer = _FakeAgent(["Answer"])
+    tracker = TelemetryTracker(tmp_path / "telemetry.jsonl", run_id="s3", phase="dev")
+    pipeline = ResearchPipeline(
+        manager=cast(Agent, manager),
+        browser=cast(Agent, browser),
+        synthesizer=cast(Agent, synthesizer),
+        spec=_SPEC,
+        tracker=tracker,
+    )
+
+    result = await run_pipeline(pipeline, "q", question_id="q4")
+    assert result.final_answer == "Answer"
