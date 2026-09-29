@@ -1,11 +1,15 @@
-"""LLM-as-judge grading for BrowseComp and ResearchRubrics.
+"""LLM-as-judge grading for BrowseComp and any rubric-graded source
+(ResearchRubrics, ResearchQA, HealthBench, ...).
 
 The BrowseComp grader prompt is the published OpenAI simple-evals template
 (github.com/openai/simple-evals/browsecomp_eval.py) so scored accuracy is
-comparable to published baselines. The ResearchRubrics grader applies each
-official per-question rubric criterion independently and reports a
-weighted-compliance score; per the plan (Phase 3), calibrate this judge
-against hand labels before trusting it as a GRPO reward signal.
+comparable to published baselines. The rubric grader applies each
+question's rubric criteria independently and reports a weighted-compliance
+score, clamped to [0, 1] -- weights may be negative (HealthBench marks
+undesirable behavior this way; a satisfied negative-weight criterion
+subtracts from the score instead of adding to it). Per the plan (Phase 3),
+calibrate this judge against hand labels before trusting it as a GRPO
+reward signal.
 """
 
 import json
@@ -111,15 +115,41 @@ class JudgeClient:
         )
         out = await self._run(judge_prompt, question_id=question_id)
         verdicts = _parse_rubric_verdicts(out, num_criteria=len(rubrics))
-
-        total_weight = sum(r.weight for r in rubrics) or 1.0
-        satisfied_weight = sum(
-            r.weight for r, v in zip(rubrics, verdicts, strict=True) if v
-        )
-        return satisfied_weight / total_weight, [
+        score = _weighted_rubric_score(rubrics, verdicts)
+        return score, [
             {"criterion": r.criterion, "satisfied": v}
             for r, v in zip(rubrics, verdicts, strict=True)
         ]
+
+
+def _weighted_rubric_score(
+    rubrics: list[RubricCriterion], verdicts: list[bool]
+) -> float:
+    """Weighted-compliance score in [0, 1], signed-weight aware.
+
+    Denominator is the sum of *positive-weight* criteria only, not all
+    criteria -- matching OpenAI's own HealthBench reference implementation
+    (``calculate_score()`` in openai/simple-evals/healthbench_eval.py:
+    ``total_possible_points = sum(points for points > 0)``). Some sources
+    (HealthBench) mark undesirable criteria with a *negative* weight
+    ("advises against seeing a doctor") -- these only ever subtract when
+    satisfied, they don't enlarge the denominator (a response isn't
+    penalized in the denominator for merely having temptations to avoid).
+    For an all-positive rubric set (ResearchRubrics, ResearchQA) every
+    weight is already positive, so this is identical to
+    ``sum(r.weight for r in rubrics)`` -- unchanged output for those
+    sources.
+
+    Clamped at 0 (OpenAI's own pipeline clips at the aggregate-mean level
+    instead of per-example, but mas-deepr's ``EvalRecord.score`` is
+    consumed per-question by bootstrap_ci/accuracy-percentage plots/W&B
+    metrics that all assume each individual score is already in [0, 1]):
+    a response that triggers mostly undesirable criteria scores 0 (as bad
+    as it gets), not a confusing negative "accuracy."
+    """
+    total_weight = sum(r.weight for r in rubrics if r.weight > 0) or 1.0
+    achieved_weight = sum(r.weight for r, v in zip(rubrics, verdicts, strict=True) if v)
+    return max(0.0, achieved_weight / total_weight)
 
 
 def _parse_rubric_verdicts(raw: str, *, num_criteria: int) -> list[bool]:

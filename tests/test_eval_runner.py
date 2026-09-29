@@ -149,3 +149,38 @@ async def test_pipeline_exception_produces_error_record(
     records = await run_benchmark(_FAKE_PIPELINE, [q])
     assert records[0].metric == "error"
     assert records[0].error is not None and "agent exploded" in records[0].error
+
+
+@pytest.mark.asyncio
+async def test_record_carries_latency_and_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_run_pipeline(monkeypatch, "Paris")
+    q = Question(
+        question_id="f9",
+        source="frames",
+        split="test",
+        prompt="capital of france?",
+        answer="Paris",
+    )
+    records = await run_benchmark(
+        _FAKE_PIPELINE, [q], cost_lookup=lambda qid: 0.0123 if qid == "f9" else 0.0
+    )
+    assert records[0].latency_s >= 0.0
+    assert records[0].cost_usd == 0.0123
+
+
+@pytest.mark.asyncio
+async def test_error_record_still_reports_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def raising_run_pipeline(*args: Any, **kwargs: Any) -> PipelineResult:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner_module, "run_pipeline", raising_run_pipeline)
+    q = Question(
+        question_id="e9", source="frames", split="test", prompt="q", answer="a"
+    )
+    records = await run_benchmark(_FAKE_PIPELINE, [q], cost_lookup=lambda qid: 0.005)
+    assert records[0].metric == "error"
+    assert records[0].cost_usd == 0.005
