@@ -8,11 +8,18 @@ import socket
 from pathlib import Path
 
 import pytest
-import torch
 
-from mas_deepr.rl.dataset import DPOExample, build_dpo_pairs
-from mas_deepr.rl.dpo import DPOTrainConfig, build_dpo_dataset, run_dpo_training
-from mas_deepr.rl.rubric_reward import RolloutOutcome
+# importorskip, not a bare `import torch` -- see test_cold_start.py's
+# comment on the same line for why (rl-art extra, not installed by CI).
+torch = pytest.importorskip("torch")
+
+from mas_deepr.rl.dataset import DPOExample, build_dpo_pairs  # noqa: E402
+from mas_deepr.rl.dpo import (  # noqa: E402
+    DPOTrainConfig,
+    build_dpo_dataset,
+    run_dpo_training,
+)
+from mas_deepr.rl.rubric_reward import RolloutOutcome  # noqa: E402
 
 _TINY_MODEL = "sshleifer/tiny-gpt2"
 
@@ -25,9 +32,12 @@ def _has_network() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _has_network(), reason="requires network to fetch tiny test model"
-)
+pytestmark = [
+    pytest.mark.art,
+    pytest.mark.skipif(
+        not _has_network(), reason="requires network to fetch tiny test model"
+    ),
+]
 
 
 def test_build_dpo_pairs_skips_zero_variance_groups() -> None:

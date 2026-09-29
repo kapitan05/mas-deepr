@@ -11,9 +11,16 @@ import socket
 from pathlib import Path
 
 import pytest
-import torch
 
-from mas_deepr.rl.cold_start import (
+# importorskip, not a bare `import torch` -- this module needs the optional
+# rl-art extra (see pyproject.toml), not installed by CI. A bare import
+# here would fail at *collection* time (before pytest.mark.art below ever
+# gets a chance to deselect it via `-m 'not art'`), aborting the whole
+# test run -- confirmed live 2026-09-29. importorskip turns a missing
+# torch into a clean per-module skip instead.
+torch = pytest.importorskip("torch")
+
+from mas_deepr.rl.cold_start import (  # noqa: E402
     ColdStartConfig,
     compute_anchor_mask,
     mask_anchors,
@@ -21,7 +28,7 @@ from mas_deepr.rl.cold_start import (
     run_cold_start_training,
     tokenize_example,
 )
-from mas_deepr.rl.dataset import SFTExample
+from mas_deepr.rl.dataset import SFTExample  # noqa: E402
 
 _TINY_MODEL = "sshleifer/tiny-gpt2"
 
@@ -34,9 +41,12 @@ def _has_network() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _has_network(), reason="requires network to fetch tiny test model"
-)
+pytestmark = [
+    pytest.mark.art,
+    pytest.mark.skipif(
+        not _has_network(), reason="requires network to fetch tiny test model"
+    ),
+]
 
 
 def test_anchor_mask_flags_only_completion_tokens_below_threshold() -> None:

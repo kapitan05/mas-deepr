@@ -43,12 +43,21 @@ from mas_deepr.config import ModelSpec, Settings, get_tool_scope
 from mas_deepr.data.schema import Question
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.rl.rubric_reward import (
+    apply_reward_shaping,
     score_rollout_group,
     score_rollout_group_verifiable,
 )
 from mas_deepr.telemetry import TelemetryTracker
 
-_MessageOrChoice = ArtMessage | OpenAIChoice
+# PEP 695 `type` statement, not a bare `X = A | B` -- required here
+# specifically because ArtMessage comes from a module CI's mypy run
+# treats as untyped (rl-art extra, see pyproject.toml's mypy override):
+# a bare assignment leaves mypy unable to tell this is meant as a type
+# alias vs. a plain variable holding an Any-typed value, and every
+# downstream annotation using it fails with "Variable ... is not valid as
+# a type". Confirmed live 2026-09-29 reproducing CI's exact env (no
+# rl-art extra installed).
+type _MessageOrChoice = ArtMessage | OpenAIChoice
 
 
 def _as_art_message(
@@ -153,7 +162,11 @@ def _entries_for_turn(turn: AgentTurn) -> list[_MessageOrChoice]:
 
 
 def build_trajectory_from_result(
-    *, question: str, result: PipelineResult, reward: float
+    *,
+    question: str,
+    result: PipelineResult,
+    reward: float,
+    extra_metrics: dict[str, float] | None = None,
 ) -> art.Trajectory:
     """Flatten one ``PipelineResult`` into an ``art.Trajectory``.
 
@@ -185,10 +198,17 @@ def build_trajectory_from_result(
     ``result.role_turns`` is empty (``run_pipeline`` called without
     ``capture_logprobs=True``), so this stays usable for callers/tests that
     don't need the real trace.
+
+    ``extra_metrics``, when given, merges onto the trajectory's metrics
+    dict -- used by ``rollout_fn`` to carry the ``reward/*`` shaping
+    components (base score, turn penalty, hallucination penalty, shaped
+    score) alongside the standard ones, so W&B shows both without a
+    separate logging path.
     """
     base_metrics: dict[str, float | int | bool] = {
         "num_sub_questions": float(len(result.sub_questions)),
         "num_raw_findings": float(len(result.raw_findings)),
+        **(extra_metrics or {}),
     }
     metadata: dict[str, float | int | str | bool | None] = {
         "question_id": result.question_id,
@@ -228,6 +248,10 @@ async def rollout_fn(
     tracker: TelemetryTracker,
     tool_scope: str = "wiki_paper",
     prefer_compiled: bool = True,
+    penalize_turns: bool = False,
+    turn_penalty_weight: float = 0.03,
+    penalize_hallucination: bool = False,
+    hallucination_penalty_weight: float = 0.15,
 ) -> art.Trajectory:
     """One ART rollout: run the MAS pipeline against ``model``'s inference
     endpoint, grade it, return a scored ``Trajectory``.
@@ -254,6 +278,13 @@ async def rollout_fn(
     answer question (MuSiQue/HotpotQA/FRAMES-shaped) grades judge-free via
     exact match -- see ``rl/rubric_reward.py``. A question with neither is
     a caller bug, not a silent zero-reward.
+
+    ``penalize_turns``/``penalize_hallucination`` (both default off, so the
+    baseline arm's reward is byte-identical unless explicitly turned on)
+    apply ``rubric_reward.apply_reward_shaping`` on top of the primary
+    score above -- see that function's docstring for the exact math. The
+    hallucination check reuses this same ``judge`` (one extra judge call
+    per rollout only when the flag is on), not a separate provider.
     """
     # model.inference_model_name is UNVERSIONED (no :stepN suffix) --
     # confirmed live 2026-09-28 that ART's ServerlessBackend rejects it
@@ -311,8 +342,30 @@ async def rollout_fn(
             ".answer -- nothing to grade against"
         )
     reward = outcomes[0].score if outcomes else 0.0
+
+    extra_metrics: dict[str, float] | None = None
+    if penalize_turns or penalize_hallucination:
+        is_hallucinating = False
+        if penalize_hallucination:
+            is_hallucinating = await judge.grade_hallucination(
+                question=question.prompt,
+                findings=result.findings,
+                response=result.final_answer,
+                question_id=question.question_id,
+            )
+        reward, extra_metrics = apply_reward_shaping(
+            base_score=reward,
+            num_role_turns=len(result.role_turns),
+            is_hallucinating=is_hallucinating,
+            turn_penalty_weight=turn_penalty_weight,
+            hallucination_penalty_weight=hallucination_penalty_weight,
+        )
+
     return build_trajectory_from_result(
-        question=question.prompt, result=result, reward=reward
+        question=question.prompt,
+        result=result,
+        reward=reward,
+        extra_metrics=extra_metrics,
     )
 
 
@@ -326,6 +379,10 @@ async def run_rollout_group(
     tool_scope: str = "wiki_paper",
     prefer_compiled: bool = True,
     llm_semaphore: asyncio.Semaphore | None = None,
+    penalize_turns: bool = False,
+    turn_penalty_weight: float = 0.03,
+    penalize_hallucination: bool = False,
+    hallucination_penalty_weight: float = 0.15,
 ) -> art.TrajectoryGroup:
     """Run ``group_size`` rollouts of the same question concurrently --
     one GRPO group.
@@ -350,6 +407,10 @@ async def run_rollout_group(
     GRPO's group-normalized advantage (``rubric_reward.group_advantages``)
     is computed by ART's own trainer from each trajectory's ``.reward``;
     this just gathers the group, it doesn't compute advantages itself.
+
+    ``penalize_turns``/``penalize_hallucination`` and their weights pass
+    straight through to every rollout in the group -- see
+    ``rollout_fn``'s docstring.
     """
 
     async def _one_rollout() -> art.Trajectory:
@@ -361,6 +422,10 @@ async def run_rollout_group(
                 tracker=tracker,
                 tool_scope=tool_scope,
                 prefer_compiled=prefer_compiled,
+                penalize_turns=penalize_turns,
+                turn_penalty_weight=turn_penalty_weight,
+                penalize_hallucination=penalize_hallucination,
+                hallucination_penalty_weight=hallucination_penalty_weight,
             )
         async with llm_semaphore:
             return await rollout_fn(
@@ -370,6 +435,10 @@ async def run_rollout_group(
                 tracker=tracker,
                 tool_scope=tool_scope,
                 prefer_compiled=prefer_compiled,
+                penalize_turns=penalize_turns,
+                turn_penalty_weight=turn_penalty_weight,
+                penalize_hallucination=penalize_hallucination,
+                hallucination_penalty_weight=hallucination_penalty_weight,
             )
 
     trajectories: list[Any] = await asyncio.gather(
