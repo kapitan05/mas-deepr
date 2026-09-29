@@ -28,25 +28,51 @@ from aiolimiter import AsyncLimiter
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 
-# One limiter/semaphore per provider, module-level -- shared across every
-# call that provider gets for the life of the server process, regardless
-# of which client (or how many concurrent client processes) issued it.
-_LIMITERS: dict[str, AsyncLimiter] = {}
-_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
+# One limiter/semaphore per (provider, event loop) -- shared across every
+# call that provider gets for the life of *that loop*. Keyed on the loop
+# too, not just the provider, because both AsyncLimiter and
+# asyncio.Semaphore bind to whichever event loop first uses them; reusing
+# one across a *different* loop is explicitly undefined behavior for
+# AsyncLimiter (aiolimiter warns on it) and a hard RuntimeError for
+# Semaphore on some versions. In production this changes nothing -- the
+# MCP server is one process with exactly one event loop for its whole
+# lifetime, so the key always resolves to the same single entry. It
+# matters for tests: pytest-asyncio gives each test function its own
+# event loop, so a module-level cache keyed on provider alone silently
+# handed a later test a limiter still bound to an earlier, already-closed
+# loop -- confirmed live 2026-09-29 as the cause of an intermittent (CI
+# only, not reproducible locally) empty-result failure in the SearXNG ->
+# Tavily fallback tests.
+_LIMITERS: dict[tuple[str, int], AsyncLimiter] = {}
+_SEMAPHORES: dict[tuple[str, int], asyncio.Semaphore] = {}
+
+
+def _limiter_for(provider: str, max_rate: float, time_period: float) -> AsyncLimiter:
+    key = (provider, id(asyncio.get_running_loop()))
+    if key not in _LIMITERS:
+        _LIMITERS[key] = AsyncLimiter(max_rate, time_period)
+    return _LIMITERS[key]
+
+
+def _semaphore_for(provider: str, max_concurrent: int) -> asyncio.Semaphore:
+    key = (provider, id(asyncio.get_running_loop()))
+    if key not in _SEMAPHORES:
+        _SEMAPHORES[key] = asyncio.Semaphore(max_concurrent)
+    return _SEMAPHORES[key]
 
 
 def rate_limited(
     provider: str, *, max_rate: float, time_period: float = 1.0
 ) -> Callable[[F], F]:
     """Decorator: cap ``provider``'s calls to ``max_rate`` per ``time_period``
-    seconds, shared across all callers within this server process."""
-    if provider not in _LIMITERS:
-        _LIMITERS[provider] = AsyncLimiter(max_rate, time_period)
-    limiter = _LIMITERS[provider]
+    seconds, shared across all callers within this server process (see
+    module docstring for why the underlying limiter is looked up per call,
+    not captured once at decoration time)."""
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            limiter = _limiter_for(provider, max_rate, time_period)
             async with limiter:
                 return await func(*args, **kwargs)
 
@@ -61,13 +87,11 @@ def concurrency_limited(provider: str, *, max_concurrent: int) -> Callable[[F], 
     process. For local-resource-bound providers (Crawl4AI's headless
     browser) rather than external-rate-limit-bound ones -- see
     ``rate_limited`` for those."""
-    if provider not in _SEMAPHORES:
-        _SEMAPHORES[provider] = asyncio.Semaphore(max_concurrent)
-    semaphore = _SEMAPHORES[provider]
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            semaphore = _semaphore_for(provider, max_concurrent)
             async with semaphore:
                 return await func(*args, **kwargs)
 
