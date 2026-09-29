@@ -1,11 +1,15 @@
-"""LLM-as-judge grading for BrowseComp and ResearchRubrics.
+"""LLM-as-judge grading for BrowseComp and any rubric-graded source
+(ResearchRubrics, ResearchQA, HealthBench, ...).
 
 The BrowseComp grader prompt is the published OpenAI simple-evals template
 (github.com/openai/simple-evals/browsecomp_eval.py) so scored accuracy is
-comparable to published baselines. The ResearchRubrics grader applies each
-official per-question rubric criterion independently and reports a
-weighted-compliance score; per the plan (Phase 3), calibrate this judge
-against hand labels before trusting it as a GRPO reward signal.
+comparable to published baselines. The rubric grader applies each
+question's rubric criteria independently and reports a weighted-compliance
+score, clamped to [0, 1] -- weights may be negative (HealthBench marks
+undesirable behavior this way; a satisfied negative-weight criterion
+subtracts from the score instead of adding to it). Per the plan (Phase 3),
+calibrate this judge against hand labels before trusting it as a GRPO
+reward signal.
 """
 
 import json
@@ -46,6 +50,22 @@ For each criterion, decide whether the response satisfies it.
 Respond with ONLY a JSON array, one object per criterion, in this exact
 form: [{"index": 0, "satisfied": true}, {"index": 1, "satisfied": false}, ...]
 No prose before or after the JSON.
+""".strip()
+
+_HALLUCINATION_JUDGE_INSTRUCTIONS = """
+You are a strict fact-checker. You will be given a research question, the
+evidence an assistant gathered while researching it (its "findings"), and
+the assistant's final answer. Decide whether the final answer asserts any
+concrete claim (a fact, number, name, date, or quote) that is NOT supported
+by the findings -- i.e. the assistant made something up rather than basing
+its answer on what it actually found.
+
+Respond with ONLY a JSON object in this exact form:
+{"hallucinated": true} or {"hallucinated": false}
+No prose before or after the JSON. If the findings are too sparse to judge
+either way, answer {"hallucinated": false} -- absence of evidence for a
+claim is not the same as evidence the claim is fabricated, and this check
+should only catch clear, checkable fabrication.
 """.strip()
 
 
@@ -111,15 +131,70 @@ class JudgeClient:
         )
         out = await self._run(judge_prompt, question_id=question_id)
         verdicts = _parse_rubric_verdicts(out, num_criteria=len(rubrics))
-
-        total_weight = sum(r.weight for r in rubrics) or 1.0
-        satisfied_weight = sum(
-            r.weight for r, v in zip(rubrics, verdicts, strict=True) if v
-        )
-        return satisfied_weight / total_weight, [
+        score = _weighted_rubric_score(rubrics, verdicts)
+        return score, [
             {"criterion": r.criterion, "satisfied": v}
             for r, v in zip(rubrics, verdicts, strict=True)
         ]
+
+    async def grade_hallucination(
+        self,
+        *,
+        question: str,
+        findings: list[str],
+        response: str,
+        question_id: str,
+    ) -> bool:
+        """Cheap, reusable fabrication check for GRPO reward shaping
+        (``rl/rubric_reward.py::apply_reward_shaping``) -- same judge client
+        already configured for the rollout (no new provider, billed the
+        same way as every other judge call). Deliberately conservative:
+        defaults to "not hallucinating" both when the judge says so AND
+        when its response fails to parse -- a judge hiccup must not
+        silently zero out a rollout's reward via the shaping penalty (see
+        ``_parse_hallucination_verdict``).
+        """
+        findings_block = (
+            "\n".join(f"- {f}" for f in findings) if findings else "(no findings)"
+        )
+        judge_prompt = (
+            f"{_HALLUCINATION_JUDGE_INSTRUCTIONS}\n\n"
+            f"Question: {question}\n\n"
+            f"Findings:\n{findings_block}\n\n"
+            f"Final answer: {response}"
+        )
+        out = await self._run(judge_prompt, question_id=question_id)
+        return _parse_hallucination_verdict(out)
+
+
+def _weighted_rubric_score(
+    rubrics: list[RubricCriterion], verdicts: list[bool]
+) -> float:
+    """Weighted-compliance score in [0, 1], signed-weight aware.
+
+    Denominator is the sum of *positive-weight* criteria only, not all
+    criteria -- matching OpenAI's own HealthBench reference implementation
+    (``calculate_score()`` in openai/simple-evals/healthbench_eval.py:
+    ``total_possible_points = sum(points for points > 0)``). Some sources
+    (HealthBench) mark undesirable criteria with a *negative* weight
+    ("advises against seeing a doctor") -- these only ever subtract when
+    satisfied, they don't enlarge the denominator (a response isn't
+    penalized in the denominator for merely having temptations to avoid).
+    For an all-positive rubric set (ResearchRubrics, ResearchQA) every
+    weight is already positive, so this is identical to
+    ``sum(r.weight for r in rubrics)`` -- unchanged output for those
+    sources.
+
+    Clamped at 0 (OpenAI's own pipeline clips at the aggregate-mean level
+    instead of per-example, but mas-deepr's ``EvalRecord.score`` is
+    consumed per-question by bootstrap_ci/accuracy-percentage plots/W&B
+    metrics that all assume each individual score is already in [0, 1]):
+    a response that triggers mostly undesirable criteria scores 0 (as bad
+    as it gets), not a confusing negative "accuracy."
+    """
+    total_weight = sum(r.weight for r in rubrics if r.weight > 0) or 1.0
+    achieved_weight = sum(r.weight for r, v in zip(rubrics, verdicts, strict=True) if v)
+    return max(0.0, achieved_weight / total_weight)
 
 
 def _parse_rubric_verdicts(raw: str, *, num_criteria: int) -> list[bool]:
@@ -137,3 +212,20 @@ def _parse_rubric_verdicts(raw: str, *, num_criteria: int) -> list[bool]:
         if isinstance(idx, int) and 0 <= idx < num_criteria:
             verdicts[idx] = bool(item.get("satisfied", False))
     return verdicts
+
+
+def _parse_hallucination_verdict(raw: str) -> bool:
+    """Parse ``{"hallucinated": bool}``; default to False (not hallucinating)
+    on any parse failure -- same "default-safe" shape as
+    ``_parse_rubric_verdicts``, but the safe default here is specifically
+    "don't penalize" rather than "don't credit": a garbled judge response
+    must not silently tank a rollout's reward through the shaping penalty.
+    """
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return False
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return False
+    return bool(parsed.get("hallucinated", False))

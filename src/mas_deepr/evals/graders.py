@@ -17,6 +17,32 @@ def normalize_text(text: str) -> str:
     return " ".join(text.split())
 
 
+_FINAL_ANSWER_RE = re.compile(r"final answer:\s*(.+)", re.IGNORECASE)
+
+
+def extract_final_answer(text: str) -> str:
+    """Pull the terse ``FINAL ANSWER: ...`` line out of a prose response.
+
+    The Synthesizer is prompted (see prompts/templates/synthesizer.yaml) to
+    end every response with exactly one such line -- exact_match/token_f1
+    compare against a terse gold string, and grading the full multi-sentence
+    explanation against it was a real bug (a response that stated the
+    correct answer up front, e.g. "Your future wife's name would be Jane
+    Ballou.", scored 0 against gold "Jane Ballou" every time). Last match,
+    not first, matching the same reasoning as judge.py's verdict parsing:
+    the explanation could itself use the phrase "final answer" in passing.
+
+    Falls back to the raw text unchanged if no such line is present (a
+    model that ignores the instruction, or older logged responses recorded
+    before this instruction existed) -- never raises, never returns empty
+    on a non-empty input.
+    """
+    matches = _FINAL_ANSWER_RE.findall(text)
+    if not matches:
+        return text
+    return matches[-1].strip()
+
+
 def exact_match(prediction: str, gold: str, aliases: list[str] | None = None) -> bool:
     candidates = [gold, *(aliases or [])]
     norm_pred = normalize_text(prediction)

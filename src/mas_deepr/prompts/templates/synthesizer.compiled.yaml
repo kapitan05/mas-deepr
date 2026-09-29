@@ -1,0 +1,90 @@
+role: synthesizer
+version: 20260926T180147Z
+source: dspy_compiled
+instructions: 'Use the run_python tool if a calculation, unit conversion, date arithmetic,
+  or count needs to be verified rather than eyeballed.
+
+
+  Synthesize sub-question findings into a final answer to the original
+
+  research question, grounded only in the provided findings.
+
+
+  Worked examples:
+
+
+  ### Example 1
+
+  augmented: True
+
+  Question: Who was president of the united states immediately following the first
+  global war after which indoor toilets became common in America?
+
+  Findings: Sub-question: Who was the president of the United States immediately following
+  the first global war?
+
+  Findings: The context provided does not include information about the president
+  of the United States immediately following the first global war.
+
+
+  Sub-question: When did indoor toilets become common in America?
+
+  Findings: The context does not provide specific information about when indoor toilets
+  became common in America. However, based on general historical knowledge, indoor
+  toilets became common in America during the late 19th and early 20th centuries,
+  particularly after the development and widespread adoption of flush toilets and
+  improvements in sanitation infrastructure. For more detailed information, additional
+  sources would be required.
+
+
+  Sub-question: What was the timeline of the first global war?
+
+  Findings: The timeline of the first global war, World War I, spans from 1914 to
+  1918, with significant events documented in the article "Timeline of World War I"
+  (https://en.wikipedia.org/wiki/Timeline_of_World_War_I).
+
+
+  Sub-question: Did the presidency following the first global war coincide with the
+  period when indoor toilets became common in America?
+
+  Findings: No, the presidency following the first global war (World War I) did not
+  coincide with the period when indoor toilets became common in America. The context
+  provided mentions that by the period following World War II, 73% of American homes
+  had indoor flush toilets, indicating that indoor toilets became common after World
+  War II, not during the presidency following World War I.
+
+  Final answer: The question cannot be fully answered based on the provided findings.
+  However, the president of the United States immediately following World War I (the
+  first global war) was Woodrow Wilson, who served until 1921. Indoor toilets became
+  common in America after World War II, not during the presidency following World
+  War I.
+
+
+  ### Example 2
+
+  Question: What U.S Highway gives access to Zilpo Road, and is also known as Midland
+  Trail?
+
+  answer: US 60
+
+  answer_aliases: []
+
+
+  ### Example 3
+
+  Question: Who is the employer of the person who said the greatest good for the greatest
+  number?
+
+  answer: New York University
+
+  answer_aliases: []
+
+
+  ### Example 4
+
+  Question: Who was inducted into the Rock and Roll Hall of Fame, David Lee Roth or
+  Cia Berg?
+
+  answer: David Lee Roth
+
+  answer_aliases: []'

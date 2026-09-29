@@ -1,62 +1,76 @@
-from pathlib import Path
+"""Tests for the primary fetch provider (Crawl4AI). Mocks
+``AsyncWebCrawler`` -- these must not require a real Playwright/Chromium
+install to run."""
+
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from mas_deepr.tools import fetch as fetch_module
-from mas_deepr.tools.cache import WebCache
-from mas_deepr.tools.fetch import fetch_page
+from mas_deepr.mcp_backend.providers.crawl4ai_fetch import fetch
+
+
+class _FakeResult:
+    def __init__(
+        self, *, success: bool, markdown: str = "", error_message: str = ""
+    ) -> None:
+        self.success = success
+        self.markdown = markdown
+        self.error_message = error_message
+
+
+def _fake_crawler(result: _FakeResult) -> Any:
+    crawler = AsyncMock()
+    crawler.arun = AsyncMock(return_value=result)
+    crawler.__aenter__ = AsyncMock(return_value=crawler)
+    crawler.__aexit__ = AsyncMock(return_value=False)
+    return crawler
 
 
 @pytest.mark.asyncio
-async def test_fetch_page_extracts_and_caches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    html = (
-        "<html><body><article><p>Hello world, this is the article "
-        "body.</p></article></body></html>"
-    )
-    calls = []
+async def test_fetch_extracts_markdown() -> None:
+    result = _FakeResult(success=True, markdown="Hello world, article body.")
+    with patch(
+        "mas_deepr.mcp_backend.providers.crawl4ai_fetch.AsyncWebCrawler",
+        return_value=_fake_crawler(result),
+    ):
+        text = await fetch("http://example.com", timeout_s=5.0, max_chars=1000)
 
-    def fake_http_get(url: str, timeout_s: float) -> str:
-        calls.append(url)
-        return html
-
-    monkeypatch.setattr(fetch_module, "_http_get", fake_http_get)
-    cache = WebCache(tmp_path / "cache.sqlite3")
-
-    text1 = await fetch_page(
-        "http://example.com", timeout_s=5.0, max_chars=1000, cache=cache
-    )
-    text2 = await fetch_page(
-        "http://example.com", timeout_s=5.0, max_chars=1000, cache=cache
-    )
-
-    assert len(calls) == 1
-    assert "Hello world" in text1
-    assert text1 == text2
+    assert "Hello world" in text
 
 
 @pytest.mark.asyncio
-async def test_fetch_page_truncates_to_max_chars(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    html = "<html><body><article><p>" + ("word " * 500) + "</p></article></body></html>"
-    monkeypatch.setattr(fetch_module, "_http_get", lambda url, timeout_s: html)
-    cache = WebCache(tmp_path / "cache.sqlite3")
+async def test_fetch_truncates_to_max_chars() -> None:
+    result = _FakeResult(success=True, markdown="word " * 500)
+    with patch(
+        "mas_deepr.mcp_backend.providers.crawl4ai_fetch.AsyncWebCrawler",
+        return_value=_fake_crawler(result),
+    ):
+        text = await fetch("http://x.com", timeout_s=5.0, max_chars=50)
 
-    text = await fetch_page("http://x.com", timeout_s=5.0, max_chars=50, cache=cache)
     assert len(text) <= 50
 
 
 @pytest.mark.asyncio
-async def test_fetch_page_failure_does_not_raise(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def raise_error(url: str, timeout_s: float) -> str:
-        raise RuntimeError("boom")
+async def test_fetch_unsuccessful_result_does_not_raise() -> None:
+    result = _FakeResult(success=False, error_message="404 not found")
+    with patch(
+        "mas_deepr.mcp_backend.providers.crawl4ai_fetch.AsyncWebCrawler",
+        return_value=_fake_crawler(result),
+    ):
+        text = await fetch("http://x.com", timeout_s=5.0, max_chars=100)
 
-    monkeypatch.setattr(fetch_module, "_http_get", raise_error)
-    cache = WebCache(tmp_path / "cache.sqlite3")
+    assert "fetch_failed" in text
 
-    text = await fetch_page("http://x.com", timeout_s=5.0, max_chars=100, cache=cache)
+
+@pytest.mark.asyncio
+async def test_fetch_exception_does_not_raise() -> None:
+    crawler = AsyncMock()
+    crawler.__aenter__ = AsyncMock(side_effect=RuntimeError("boom"))
+    with patch(
+        "mas_deepr.mcp_backend.providers.crawl4ai_fetch.AsyncWebCrawler",
+        return_value=crawler,
+    ):
+        text = await fetch("http://x.com", timeout_s=5.0, max_chars=100)
+
     assert "fetch_failed" in text

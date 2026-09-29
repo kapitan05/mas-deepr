@@ -2,11 +2,13 @@ from mas_deepr.evals.graders import best_f1, exact_match, normalize_text, token_
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.evals.runner import (
     EvalRecord,
+    generate_benchmark,
+    grade_benchmark,
     records_to_df,
     run_benchmark,
     write_results,
 )
-from mas_deepr.evals.stats import bootstrap_ci
+from mas_deepr.evals.stats import bootstrap_ci, paired_bootstrap_diff
 
 __all__ = [
     "EvalRecord",
@@ -14,7 +16,10 @@ __all__ = [
     "best_f1",
     "bootstrap_ci",
     "exact_match",
+    "generate_benchmark",
+    "grade_benchmark",
     "normalize_text",
+    "paired_bootstrap_diff",
     "records_to_df",
     "run_benchmark",
     "token_f1",

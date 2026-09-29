@@ -19,7 +19,6 @@ from mas_deepr.optimize.metric import research_metric
 from mas_deepr.optimize.modules import ResearchProgram, make_retriever
 from mas_deepr.optimize.render import render_compiled_prompt
 from mas_deepr.prompts import save_compiled_prompt
-from mas_deepr.tools import WebCache
 
 _ROLES = ("manager", "browser", "synthesizer")
 
@@ -62,8 +61,11 @@ def compile_pipeline(
             "examples -- need both non-empty to compile."
         )
 
-    cache = WebCache(settings.cache_db)
-    retriever = make_retriever(settings=settings, cache=cache)
+    # make_retriever builds its own MCPToolClient per call now (see its own
+    # docstring -- a shared client's semaphores can't cross the fresh event
+    # loop each asyncio.run() creates, which MIPROv2's parallel evaluation
+    # hits constantly).
+    retriever = make_retriever(settings=settings)
     program = ResearchProgram(
         retrieve=retriever, max_sub_queries=settings.max_sub_queries
     )

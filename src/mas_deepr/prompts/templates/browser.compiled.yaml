@@ -1,0 +1,117 @@
+role: browser
+version: 20260926T180147Z
+source: dspy_compiled
+instructions: "Use the web_search tool to find candidate sources, then use fetch_page\
+  \ to read the most promising results before answering. Verify claims against a fetched\
+  \ source rather than answering from prior knowledge alone.\n\nAnswer the sub-question\
+  \ directly and concisely, using only the information provided in the context. If\
+  \ the context does not contain relevant information, state that no answer can be\
+  \ determined from the given context.\n\nWorked examples:\n\n### Example 1\naugmented:\
+  \ True\nSub-question: Are there official records or sources that confirm the opening\
+  \ date of the institute?\nEvidence gathered: [1] Sergey Sobyanin (https://en.wikipedia.org/wiki/Sergey_Sobyanin)\n\
+  Putin noted at a meeting with Sobyanin that the mayor&#039;s team &quot;generally\
+  \ works professionally,&quot; but there are still &quot;chronic problems&quot; in\
+  \ Moscow - traffic\nFetched content: [Jump to content](https://en.wikipedia.org/wiki/Sergey_Sobyanin#bodyContent)\n\
+  Main menu\nMain menu\nmove to sidebar hide\nNavigation \n  * [Main page](https://en.wikipedia.org/wiki/Main_Page\
+  \ \"Visit the main page \\[ctrl-option-z\\]\")\n  * [Contents](https://en.wikipedia.org/wiki/Wikipedia:Contents\
+  \ \"Guides to browsing Wikipedia\")\n  * [Current events](https://en.wikipedia.org/wiki/Portal:Current_events\
+  \ \"Articles related to current events\")\n  * [Random article](https://en.wikipedia.org/wiki/Special:Random\
+  \ \"Visit a randomly selected article \\[ctrl-option-x\\]\")\n  * [About Wikipedia](https://en.wikipedia.org/wiki/Wikipedia:About\
+  \ \"Learn about Wikipedia and how it works\")\n  * [Contact us](https://en.wikipedia.org/wiki/Wikipedia:Contact_us\
+  \ \"How to contact Wikipedia\")\n\n\nContribute \n  * [Help](https://en.wikipedia.org/wiki/Help:Contents\
+  \ \"Guidance on how to use and edit Wikipedia\")\n  * [Learn to edit](https://en.wikipedia.org/wiki/Help:Introduction\
+  \ \"Learn how to edit Wikipedia\")\n  * [Community portal](https://en.wikipedia.org/wiki/Wikipedia:Community_portal\
+  \ \"The hub for editors\")\n  * [Recent changes](https://en.wikipedia.org/wiki/Special:RecentChanges\
+  \ \"A list of recent changes to Wikipedia \\[ctrl-option-r\\]\")\n  * [Upload file](https://en.wikipedia.org/wiki/Wikipedia:File_upload_wizard\
+  \ \"Add images or other media for use on Wikipedia\")\n  * [Special pages](https://en.wikipedia.org/wiki/Special:SpecialPages\
+  \ \"A list of all special pages \\[ctrl-option-q\\]\")\n\n\n[ ![](https://en.wikipedia.org/static/images/icons/enwiki-25.svg)\
+  \ ![Wikipedia](https://en.wikipedia.org/static/images/mobile/copyright/wikipedia-wordmark-en-25.svg)\
+  \ ![The Free Encyclopedia](https://en.wikipedia.org/static/images/mobile/copyright/wikipedia-tagline-en-25.svg)\
+  \ ](https://en.wikipedia.org/wiki/Main_Page)\n[ Search ](https://en.wikipedia.org/wiki/Special:Search\
+  \ \"Search Wikipedia \\[ctrl-option-f\\]\")\nSearch\nAppearance\nAppearance\nmove\
+  \ to sidebar hide\n  * [Donate](https://donate.wikimedia.org/?wmf_source=donate&wmf_medium=sidebar&wmf_campaign=en.wikipedia.org&uselang=en)\n\
+  \  * [Create account](https://en.wikipedia.org/w/index.php?title=Special:CreateAccount&returnto=Sergey+Sobyanin\
+  \ \"You are encouraged to create an account and log in; however, it is not mandatory\"\
+  )\n  * [Log in](https://en.wikipedia.org/w/index.php?title=Special:UserLogin&returnto=Sergey+Sobyanin\
+  \ \"You're encouraged to log in; however, it's not mandatory. \\[ctrl-option-o\\\
+  ]\")\n\n\nPersonal tools\n  * [ Donate](https://donate.wikimedia.org/?wmf_source=donate&wmf_medium=sidebar&wmf_campaign=en.wikipedia.org&uselang=en)\n\
+  \  * [ Create account](https://en.wikipedia.org/w/index.php?title=Special:CreateAccount&returnto=Sergey+Sobyanin\
+  \ \"You are encouraged to create an account and log in; however, it is not mandatory\"\
+  )\n  * [ Log in](https://en.wikipedia.org/w/index.php?title=Special:UserLogin&returnto=Sergey+Sobyanin\
+  \ \"You're encouraged to log in; however, it's not mandatory. \\[ctrl-option-o\\\
+  ]\")\n\n\nToggle the table of contents\n## Contents\nmove to sidebar hide\n  * [\
+  \ (Top) ](https://en.wikipedia.org/wiki/Sergey_Sobyanin)\n  * [ 1 Early life and\
+  \ career ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Early_life_and_career)\n\
+  \  * [ 2 Political career ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Political_career)\n\
+  \  * [ 3 Mayor of Moscow ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Mayor_of_Moscow)\
+  \ Toggle Mayor of Moscow subsection\n    * [ 3.1 Transport policy, public transport\
+  \ and road construction ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Transport_policy,_public_transport_and_road_construction)\n\
+  \    * [ 3.2 Urban planning policy ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Urban_planning_policy)\n\
+  \    * [ 3.3 Social policy ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Social_policy)\n\
+  \    * [ 3.4 Environmental policy ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Environmental_policy)\n\
+  \    * [ 3.5 Administrative policy ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Administrative_policy)\n\
+  \  * [ 4 Public perception ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Public_perception)\n\
+  \  * [ 5 Family and personal life ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Family_and_personal_life)\n\
+  \  * [ 6 Sanctions ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Sanctions)\n\
+  \  * [ 7 Awards ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Awards)\n  * [ 8\
+  \ Notes ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#Notes)\n  * [ 9 External\
+  \ links ](https://en.wikipedia.org/wiki/Sergey_Sobyanin#External_links)\n\n\n# Sergey\
+  \ Sobyanin\n43 languages\n  * [\u0627\u0644\u0639\u0631\u0628\u064A\u0629](https://ar.wikipedia.org/wiki/%D8%B3%D8%B1%D8%BA%D9%8A_%D8%B3%D9%88%D8%A8%D9%8A%D8%A7%D9%86%D9%8A%D9%86\
+  \ \"\u0633\u0631\u063A\u064A \u0633\u0648\u0628\u064A\u0627\u0646\u064A\u0646 \u2013\
+  \ Arabic\")\n  * [\u0411\u0435\u043B\u0430\u0440\u0443\u0441\u043A\u0430\u044F](https://be.wikipedia.org/wiki/%D0%A1%D1%8F%D1%80%D0%B3%D0%B5%D0%B9_%D0%A1%D1%8F%D0%BC%D1%91%D0%BD%D0%B0%D0%B2%D1%96%D1%87_%D0%A1%D0%B0%D0%B1%D1%8F%D0%BD%D1%96%D0%BD\
+  \ \"\u0421\u044F\u0440\u0433\u0435\u0439 \u0421\u044F\u043C\u0451\u043D\u0430\u0432\
+  \u0456\u0447 \u0421\u0430\u0431\u044F\u043D\u0456\u043D \u2013 Belarusian\")\n \
+  \ * [\u0411\u044A\u043B\u0433\u0430\u0440\u0441\u043A\u0438](https://bg.wikipedia.org/wiki/%D0%A1%D0%B5%D1%80%D0%B3%D0%B5%D0%B9_%D0%A1%D0%BE%D0%B1%D1%8F%D0%BD%D0%B8%D0%BD\
+  \ \"\u0421\u0435\u0440\u0433\u0435\u0439 \u0421\u043E\u0431\u044F\u043D\u0438\u043D\
+  \ \u2013 Bulgarian\")\n  * [\u010Ce\u0161tina](https://cs.wikipedia.org/wiki/Sergej_Sobjanin\
+  \ \"Sergej Sobjanin \u2013 Czech\")\n  * [Dansk](https://da.wikipedia.org/wiki/Sergej_Sobjanin\
+  \ \"Sergej Sobjanin \u2013 Danish\")\n  * [Deutsch](https://de.wikipedia.org/wiki/Sergei_Semjonowitsch_Sobjanin\
+  \ \"Sergei Semjonowitsch Sobjanin \u2013 German\")\n  * [Esperanto](https://eo.wikipedia.org/wiki/Sergej_Sobjanin\
+  \ \"Sergej Sobjanin \u2013 Esperanto\")\n  * [Espa\xF1ol](https://es.wikipedia.org/wiki/Sergu%C3%A9i_Sobianin\
+  \ \"Sergu\xE9i Sobianin \u2013 Spanish\")\n  * [Eesti](https://et.wikipedia.org/wiki/Sergei_Sobjanin\
+  \ \"Sergei Sobjanin \u2013 Estonian\")\n  * [\u0641\u0627\u0631\u0633\u06CC](https://fa.wikipedia.org/wiki/%D8%B3%D8%B1%DA%AF%D8%A6%DB%8C_%D8%B3%D8%A7%D8%A8%DB%8C%D8%A7%D9%86%DB%8C%D9%86\
+  \ \"\u0633\u0631\u06AF\u0626\u06CC \u0633\u0627\u0628\u06CC\u0627\u0646\u06CC\u0646\
+  \ \u2013 Persian\")\n  * [Suomi](https://fi.wikipedia.org/wiki/Sergei_Sobjanin \"\
+  Sergei Sobjanin \u2013 Finnish\")\n  * [Fran\xE7ais](https://fr.wikipedia.org/wiki/Sergue%C3%AF_Sobianine\
+  \ \"Sergue\xEF Sobianine \u2013 French\")\n  * [\u05E2\u05D1\u05E8\u05D9\u05EA](https://he.wikipedia.org/wiki/%D7%A1%D7%A8%D7%92%D7%99%D7%99_%D7%A1%D7%95%D7%91%D7%99%D7%90%D7%A0%D7%99%D7%9F\
+  \ \"\u05E1\u05E8\u05D2\u05D9\u05D9 \u05E1\u05D5\u05D1\u05D9\u05D0\u05E0\u05D9\u05DF\
+  \ \u2013 Hebrew\")\n  * [\u0540\u0561\u0575\u0565\u0580\u0565\u0576](https://hy.wikipedia.org/wiki/%D5%8D%D5%A5%D6%80%D5%A3%D5%A5%D5%B5_%D5%8D%D5%B8%D5%A2%D5%B5%D5%A1%D5%B6%D5%AB%D5%B6\
+  \ \"\u054D\u0565\u0580\u0563\u0565\u0575 \u054D\u0578\u0562\u0575\u0561\u0576\u056B\
+  \u0576 \u2013 Armenian\")\n  * [Bahasa Indonesia](https://id.wikipedia.org/wiki/Sergey_Sobyanin\
+  \ \"Sergey Sobyanin \u2013 Indonesian\")\n  * [Italiano](https://it.wikipedia.org/wiki/Sergej_Sem%C3%ABnovi%C4%8D_Sobjanin\
+  \ \"Sergej Sem\xEBnovi\u010D Sobjanin \u2013 Italian\")\n  * [\u65E5\u672C\u8A9E\
+  ](https://ja.wikipedia.org/wiki/%E3%82%BB%E3%83%AB%E3%82%B2%E3%82%A4%E3%83%BB%E3%82%BD%E3%83%93%E3%83%A3%E3%83%BC%E3%83%8B%E3%83%B3\
+  \ \"\u30BB\u30EB\u30B2\u30A4\u30FB\u30BD\u30D3\u30E3\u30FC\u30CB\u30F3 \u2013 Japanese\"\
+  )\n  * [\u10E5\u10D0\u10E0\u10D7\u10E3\u10DA\u10D8](https://ka.wikipedia.org/wiki/%E1%83%A1%E1%83%94%E1%83%A0%E1%83%92%E1%83%94%E1%83%98_%E1%83%A1%E1%83%9D%E1%83%91%E1%83%98%E1%83%90%E1%83%9C%E1%83%98%E1%83%9C%E1%83%98\
+  \ \"\u10E1\u10D4\u10E0\u10D2\u10D4\u10D8 \u10E1\u10DD\u10D1\u10D8\u10D0\u10DC\u10D8\
+  \u10DC\u10D8 \u2013 Georgian\")\n  * [\uD55C\uAD6D\uC5B4](https://ko.wikipedia.org/wiki/%EC%84%B8%EB%A5%B4%EA%B2%8C%EC%9D%B4_%EC%86%8C%EB%B1%8C%EB%8B%8C\
+  \ \"\uC138\uB974\uAC8C\uC774 \uC18C\uBC4C\uB2CC \u2013 Korean\")\n  * [\u041A\u043E\
+  \u043C\u0438](https://kv.wikipedia.org/wiki/%D0%A1%D0%B5%D1%80%D0%B3%D0%B5%D0%B9_%D0%A1%D0%BE%D0%B1%D1%8F%D0%BD%D0%B8%D0%BD\
+  \ \"\u0421\u0435\u0440\u0433\u0435\u0439 \u0421\u043E\u0431\u044F\u043D\u0438\u043D\
+  \ \u2013 Komi\")\n  * [L\xEBtzebuergesch](https://lb.wikipedia.org/wiki/Sergei_Semjonowitsch_Sobjanin\
+  \ \"Sergei Semjonowitsch Sobjanin \u2013 Luxembourgish\")\n  * [Lietuvi\u0173](https://lt.wikipedia.org/wiki/Sergejus_Sobianinas\
+  \ \"Sergejus Sobianinas \u2013 Lithuanian\")\n  * [Malagasy](https://mg.wikipedia.org/wiki/Sergue%C3%AF_Sobianine\
+  \ \"Sergue\xEF Sobianine \u2013 Malagasy\")\n  * [\u041C\u0430\u043A\u0435\u0434\
+  \u043E\u043D\u0441\u043A\u0438](https://mk.wikipedia.org/wiki/%D0%A1%D0%B5%D1%80%D0%B3%D0%B5%D1%98_%D0%A1%D0%BE%D0%B1%D1%98%D0%B0%D0%BD%D0%B8%D0%BD\
+  \ \"\u0421\u0435\u0440\u0433\u0435\u0458 \u0421\u043E\u0431\u0458\u0430\u043D\u0438\
+  \u043D \u2013 Macedonian\")\n  * [\u041C\u043E\u043D\u0433\u043E\u043B](https://mn.wikipedia.org/wiki/%D0%A1%D0%B5%D1%80%D0%B3%D0%B5%D0%B9_%D0%A1%D0%BE%D0%B1%D1%8F%D0%BD%D0%B8%D0%BD\
+  \ \"\u0421\u0435\u0440\u0433\u0435\u0439 \u0421\u043E\u0431\u044F\u043D\u0438\u043D\
+  \ \u2013 Mongolian\")\n  * [Bahasa Melayu](https://ms.wikipedia.org/wiki/Sergey_Sobyanin\
+  \ \"Sergey Sobyanin \u2013 Malay\")\n  * [Norsk bokm\xE5l](https://no.wikipedia.org/wiki/Sergej_Sobjanin\
+  \ \"Sergej Sobjanin \u2013 Norwegian Bokm\xE5l\")\n  * [\u0418\u0440\u043E\u043D\
+  ](https://os.wikipedia.org/wiki/%D0%A1%D0%BE%D0%B1%D1%8F%D\n\n[2] The Fate of the\
+  \ Furious (https://en.wikipedia.org/wiki/The_Fate_of_the_Furious)\nimmediately before\
+  \ the release of Furious 7, with Diesel, Morgan, and producer Neal H. Moritz re-signing.\
+  \ After setting an initial release date in that same month\n\n[3] Coyote vs. Acme\
+  \ (https://en.wikipedia.org/wiki/Coyote_vs._Acme)\n Retrieved July 27, 2026. &quot;&#039;Coyote\
+  \ vs. Acme&#039; Confirms Long-Awaited UK &amp; Irish Cinema Release Date&quot;.\
+  \ The Arts Shelf. June 20, 2026. Retrieved August 25\nAnswer: There is no official\
+  \ record or source in the provided context that confirms the opening date of the\
+  \ institute. The context includes information about Sergey Sobyanin, The Fate of\
+  \ the Furious, and Coyote vs. Acme, but none of these sources mention an institute\
+  \ or its opening date.\n\n### Example 2\nquestion: Are the New Orleans Outfall Canals\
+  \ the same length as the Augusta Canal?\nanswer: yes\nanswer_aliases: []\n\n###\
+  \ Example 3\nquestion: Mackenzie Davis appeared in the 2013 Canadian romantic comedy\
+  \ film directed by whom?\nanswer: Michael Dowse\nanswer_aliases: []\n\n### Example\
+  \ 4\nquestion: The Golden Globe Award winner for best actor from \"Roseanne\" starred\
+  \ along what actress in Gigantic?\nanswer: Zooey Deschanel\nanswer_aliases: []"

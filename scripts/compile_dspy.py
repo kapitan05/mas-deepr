@@ -1,7 +1,7 @@
 """Phase 2: compile Manager/Browser/Synthesizer prompts with DSPy's MIPROv2.
 
 Optimizes against the train-pool split (MuSiQue + HotpotQA) only -- FRAMES,
-BrowseComp, and ResearchRubrics are never touched here. Writes
+ResearchRubrics, ResearchQA, and HealthBench are never touched here. Writes
 ``*.compiled.yaml`` to the prompt registry; run the ``post-dspy`` milestone
 afterward to evaluate the frozen result.
 
@@ -15,7 +15,8 @@ Usage:
 
 import argparse
 
-from mas_deepr.config import get_model, get_settings
+from mas_deepr.config import get_model, get_settings, get_tool_scope
+from mas_deepr.logging_config import configure_logging
 from mas_deepr.optimize import compile_pipeline
 
 
@@ -46,8 +47,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    configure_logging()
     settings = get_settings()
     settings.ensure_dirs()
+    # Train-pool (MuSiQue+HotpotQA) is wiki-answerable -- wiki_paper scope
+    # avoids hammering SearXNG's scraped engines at compile-time rollout
+    # volume, same reliability reasoning as the eval side (see
+    # config/tool_scopes.py).
+    settings.mcp_enabled_tools = get_tool_scope("wiki_paper")
     spec = get_model(args.model)
 
     written = compile_pipeline(

@@ -8,11 +8,14 @@ search queries and page fetches share one table with no collisions.
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS http_cache (
@@ -53,6 +56,7 @@ class WebCache:
             row = conn.execute(
                 "SELECT payload FROM http_cache WHERE key = ?", (key,)
             ).fetchone()
+        logger.debug("cache %s key=%s", "hit" if row else "miss", key[:12])
         return json.loads(row[0]) if row else None
 
     def set(self, key: str, kind: str, payload: dict[str, Any]) -> None:
@@ -62,3 +66,4 @@ class WebCache:
                 "VALUES (?, ?, ?)",
                 (key, kind, json.dumps(payload, ensure_ascii=False)),
             )
+        logger.debug("cache store kind=%s key=%s", kind, key[:12])

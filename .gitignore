@@ -11,4 +11,19 @@ wheels/
 
 /docs
 /papers
+/notebooks
 CLAUDE.md
+
+# Generated at runtime -- eval/telemetry outputs, RL training artifacts
+/runs
+/assets
+.art/
+
+.env
+
+# Local-only -- binary Word doc, not meant for the public repo; docs
+# reference it as a local file, not something to fetch from GitHub.
+thesis.docx
+
+# W&B local run mirrors (eval + GRPO telemetry) -- regenerated per run.
+/wandb

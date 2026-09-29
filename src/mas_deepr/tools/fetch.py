@@ -1,76 +1,29 @@
-"""Page-fetch tool: HTTP GET + readability extraction, cached and retried."""
+"""Page-fetch tool -- proxies to the MCP tool backend's ``fetch_page``
+(Crawl4AI by default; see ``mcp_backend/providers/crawl4ai_fetch.py``).
 
-import asyncio
+Provider logic (Crawl4AI, caching, retry) now lives server-side in
+``mcp_backend/``; this module is a thin MAF ``@tool`` wrapper around
+``MCPToolClient.call(...)`` -- same tool name/schema/return contract as
+before the MCP adoption.
+"""
+
 from typing import Annotated
 
-import httpx
-import trafilatura
 from agent_framework import FunctionTool, tool
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-from mas_deepr.tools.cache import WebCache
-
-_RETRYABLE = (httpx.TransportError, httpx.TimeoutException)
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type(_RETRYABLE),
-    reraise=True,
-)
-def _http_get(url: str, timeout_s: float) -> str:
-    resp = httpx.get(
-        url,
-        timeout=timeout_s,
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (research-agent; +mas-deepr)"},
-    )
-    resp.raise_for_status()
-    return resp.text
-
-
-async def fetch_page(
-    url: str,
-    *,
-    timeout_s: float,
-    max_chars: int,
-    cache: WebCache,
-) -> str:
-    """Fetch a URL and return cleaned main-content text, truncated to ``max_chars``.
-
-    Successful extractions are cached indefinitely by URL. Failures
-    (paywalls, non-HTML content, timeouts, etc.) return an empty-content
-    marker rather than raising, so a single bad URL doesn't abort the agent
-    loop -- but failures are never cached, since a transient error must not
-    permanently poison the reproducibility cache.
-    """
-    cache_key = cache.make_key("fetch", url=url)
-    cached = cache.get(cache_key)
-    if cached is not None:
-        text: str = cached["text"]
-        return text
-
-    try:
-        html = await asyncio.to_thread(_http_get, url, timeout_s)
-        extracted = trafilatura.extract(html, favor_recall=True) or ""
-    except Exception as e:
-        return f"[fetch_failed: {type(e).__name__}: {e}]"[:max_chars]
-
-    text = extracted[:max_chars]
-    cache.set(cache_key, "fetch", {"text": text})
-    return text
+from mas_deepr.telemetry import TelemetryTracker
+from mas_deepr.tools.mcp_client import MCPToolClient
+from mas_deepr.tools.tool_telemetry import current_question_id, record_tool_call
 
 
 def make_fetch_page_tool(
-    *, timeout_s: float, max_chars: int, cache: WebCache
+    *,
+    mcp_client: MCPToolClient,
+    tracker: TelemetryTracker,
+    timeout_s: float,
+    max_chars: int,
 ) -> FunctionTool:
-    """Build the MAF-callable fetch tool bound to concrete settings/cache."""
+    """Build the MAF-callable fetch tool bound to a concrete MCP client."""
 
     @tool(
         name="fetch_page",
@@ -82,8 +35,14 @@ def make_fetch_page_tool(
     async def fetch_page_tool(
         url: Annotated[str, "The absolute URL to fetch."],
     ) -> str:
-        return await fetch_page(
-            url, timeout_s=timeout_s, max_chars=max_chars, cache=cache
+        return await record_tool_call(
+            tracker,
+            tool_name="fetch_page",
+            provider="crawl4ai",
+            question_id=current_question_id.get(),
+            call=lambda: mcp_client.call(
+                "fetch_page", url=url, timeout_s=timeout_s, max_chars=max_chars
+            ),
         )
 
     return fetch_page_tool

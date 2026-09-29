@@ -1,60 +1,70 @@
-from pathlib import Path
-from typing import Any
+"""Tests for the primary search provider (SearXNG). See test_tavily.py for
+the opt-in fallback provider."""
 
+import httpx
 import pytest
+import respx
 
-from mas_deepr.tools import search as search_module
-from mas_deepr.tools.cache import WebCache
-from mas_deepr.tools.search import web_search
+from mas_deepr.mcp_backend.providers.searxng import search as searxng_search
 
 
 @pytest.mark.asyncio
-async def test_web_search_hits_backend_once_then_caches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = []
-
-    def fake_tavily_search(client: Any, query: str, max_results: int) -> dict[str, Any]:
-        calls.append(query)
-        return {
-            "results": [
-                {"title": "A", "url": "http://a.com", "content": "snippet a"},
-                {"title": "B", "url": "http://b.com", "content": "snippet b"},
-            ]
-        }
-
-    monkeypatch.setattr(search_module, "_tavily_search", fake_tavily_search)
-    cache = WebCache(tmp_path / "cache.sqlite3")
-
-    hits1 = await web_search(
-        "capital of france", max_results=2, api_key="fake", cache=cache
-    )
-    hits2 = await web_search(
-        "capital of france", max_results=2, api_key="fake", cache=cache
+@respx.mock
+async def test_searxng_search_normalizes_hits() -> None:
+    route = respx.get("http://searxng.local/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"title": "A", "url": "http://a.com", "content": "snippet a"},
+                    {"title": "B", "url": "http://b.com", "content": "snippet b"},
+                ]
+            },
+        )
     )
 
-    assert len(calls) == 1  # second call served from cache
-    assert hits1 == hits2
-    assert hits1 == [
+    hits = await searxng_search(
+        "capital of france", max_results=2, base_url="http://searxng.local"
+    )
+
+    assert route.called
+    assert hits == [
         {"title": "A", "url": "http://a.com", "snippet": "snippet a"},
         {"title": "B", "url": "http://b.com", "snippet": "snippet b"},
     ]
 
 
 @pytest.mark.asyncio
-async def test_web_search_respects_max_results(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def fake_tavily_search(client: Any, query: str, max_results: int) -> dict[str, Any]:
-        return {
-            "results": [
-                {"title": str(i), "url": f"http://{i}.com", "content": ""}
-                for i in range(5)
-            ]
-        }
+@respx.mock
+async def test_searxng_search_respects_max_results() -> None:
+    respx.get("http://searxng.local/search").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"title": str(i), "url": f"http://{i}.com", "content": ""}
+                    for i in range(5)
+                ]
+            },
+        )
+    )
 
-    monkeypatch.setattr(search_module, "_tavily_search", fake_tavily_search)
-    cache = WebCache(tmp_path / "cache.sqlite3")
-
-    hits = await web_search("q", max_results=2, api_key="fake", cache=cache)
+    hits = await searxng_search("q", max_results=2, base_url="http://searxng.local")
     assert len(hits) == 2
+
+
+@pytest.mark.asyncio
+async def test_searxng_search_requires_base_url() -> None:
+    with pytest.raises(ValueError, match="not configured"):
+        await searxng_search("q", max_results=2, base_url="")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_searxng_search_raises_on_missing_json_format() -> None:
+    respx.get("http://searxng.local/search").mock(
+        return_value=httpx.Response(200, json={"unrelated": "shape"})
+    )
+
+    with pytest.raises(ValueError, match="results"):
+        await searxng_search("q", max_results=2, base_url="http://searxng.local")

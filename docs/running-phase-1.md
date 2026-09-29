@@ -39,6 +39,14 @@ OPENAI_API_KEY=sk-...        # NOT MAS_-prefixed — see note below
 
 # Web search tool
 TAVILY_API_KEY=tvly-...      # NOT MAS_-prefixed — see note below
+
+# Frontier comparison baselines (only for --models gpt-4.1/gemini-2.5-pro/deepseek-chat)
+GEMINI_API_KEY=...           # Google AI Studio key (Gemini via OpenAI-compat endpoint)
+DEEPSEEK_API_KEY=...         # platform.deepseek.com key
+# gpt-4.1 reuses OPENAI_API_KEY above.
+
+# Monitoring (optional -- omit for JSONL-only telemetry)
+WANDB_API_KEY=...
 ```
 
 `OPENAI_API_KEY` and `TAVILY_API_KEY` are read under their own conventional
@@ -49,7 +57,10 @@ automatically without duplicating them.
 You only need `OPENAI_API_KEY` if you're running the `browsecomp` or
 `research_rubrics` benchmarks (both require a judge). `frames` alone needs
 neither the judge nor Tavily's paid tier headroom, since it's graded by
-exact match.
+exact match. `GEMINI_API_KEY` / `DEEPSEEK_API_KEY` are only needed when the
+frontier models are in `--models`; each frontier `ModelSpec` names its own
+key env var (`config/models.py`). `WANDB_API_KEY` turns on the optional W&B
+mirror (`docs/eval-architecture.md`); without it telemetry is JSONL-only.
 
 ## 2. Fast dev-loop iteration
 
