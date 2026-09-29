@@ -42,7 +42,17 @@ async def test_web_search_falls_back_to_tavily_on_empty_searxng_results(
         runs_dir=tmp_path / "runs",
         cache_db=tmp_path / "cache.sqlite3",
         searxng_base_url="http://searxng.invalid",
-        tavily_api_key="tvly-fake",
+        # NOT tavily_api_key=... -- that field has validation_alias=
+        # "TAVILY_API_KEY" (settings.py), so pydantic-settings only
+        # accepts the alias as an init kwarg, not the original field
+        # name (no populate_by_name=True configured); tavily_api_key=
+        # here is silently ignored, falling through to the environment/
+        # .env instead. Confirmed live 2026-09-29: this made the test
+        # pass on any machine with a real TAVILY_API_KEY in .env
+        # (truthy by coincidence) while failing 100% reliably in CI
+        # (no such key -> settings.tavily_api_key == "" -> the fallback
+        # branch's `if ... and settings.tavily_api_key:` never fires).
+        TAVILY_API_KEY="tvly-fake",  # type: ignore[call-arg]
     )
     async with await _build_client(settings) as client:
         result = await client.call_tool("web_search", {"query": "q", "max_results": 1})
@@ -67,7 +77,8 @@ async def test_web_search_falls_back_to_tavily_on_searxng_exception(
         runs_dir=tmp_path / "runs",
         cache_db=tmp_path / "cache.sqlite3",
         searxng_base_url="http://searxng.invalid",
-        tavily_api_key="tvly-fake",
+        # See the sibling test above for why this must be the alias name.
+        TAVILY_API_KEY="tvly-fake",  # type: ignore[call-arg]
     )
     async with await _build_client(settings) as client:
         result = await client.call_tool("web_search", {"query": "q", "max_results": 1})

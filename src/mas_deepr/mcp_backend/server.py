@@ -127,16 +127,6 @@ def build_server(settings: Settings) -> FastMCP:
         if not hits and settings.tavily_api_key:
             logger.info("web_search: SearXNG returned no results, trying Tavily")
             hits = await _tavily(query, max_results=max_results)
-            # TEMPORARY diagnostic for the CI-only (not locally
-            # reproducible) empty-fallback failure -- remove once
-            # understood. Logged at WARNING so it's captured on failure
-            # regardless of configured log level.
-            logger.warning(
-                "DIAG tavily fallback hits=%r tavily.search id=%r api_key=%r",
-                hits,
-                id(tavily.search),
-                settings.tavily_api_key,
-            )
         return hits
 
     @mcp.tool
