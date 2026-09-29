@@ -14,7 +14,20 @@ def test_load_prompt_hand_written(role: str) -> None:
     assert len(template.instructions.strip()) > 0
 
 
-def test_load_prompt_falls_back_when_no_compiled_variant() -> None:
+def test_load_prompt_falls_back_when_no_compiled_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Isolated from the real templates dir -- a real manager.compiled.yaml
+    # exists on disk (DSPy has actually been run), which would make this
+    # test of the *no-compiled-variant* fallback path a false pass/fail
+    # depending on what's currently compiled.
+    monkeypatch.setattr(registry_module, "_TEMPLATES_DIR", tmp_path)
+    (tmp_path / "manager.yaml").write_text(
+        "role: manager\nversion: '0.1.0'\nsource: hand_written\n"
+        "instructions: |\n  hand-written text\n",
+        encoding="utf-8",
+    )
+
     hand_written = load_prompt("manager")
     fallback = load_prompt("manager", prefer_compiled=True)
     assert fallback == hand_written

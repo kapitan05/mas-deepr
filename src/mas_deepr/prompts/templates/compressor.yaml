@@ -1,0 +1,8 @@
+role: compressor
+version: "0.1.0"
+source: hand_written
+instructions: |
+  You compress one research pass's trajectory into a structured JSON state
+  for the next pass to build on. Follow the exact JSON schema requested in
+  the prompt precisely -- respond with ONLY that JSON object, no commentary
+  before or after it.

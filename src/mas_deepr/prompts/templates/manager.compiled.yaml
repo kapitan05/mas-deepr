@@ -1,0 +1,77 @@
+role: manager
+version: 20260926T180147Z
+source: dspy_compiled
+instructions: 'Break a research question into 1-4 focused sub-questions whose answers
+
+  give enough evidence to answer the original question.
+
+
+  Worked examples:
+
+
+  ### Example 1
+
+  augmented: True
+
+  Question: What is the college Francis Walsingham attended an instance of?
+
+  Sub-questions: 1. What educational institutions did Francis Walsingham attend during
+  his youth?
+
+  2. What was the nature of the education provided at the institution(s) he attended?
+
+  3. How does the institution Francis Walsingham attended reflect the educational
+  trends of his time?
+
+  4. What historical significance does the institution hold in relation to Walsingham''s
+  life and career?
+
+
+  ### Example 2
+
+  augmented: True
+
+  Question: What type of university is the college Kyeon Mi-ri attended?
+
+  Sub-questions: 1. What is the name of the university attended by Kyeon Mi-ri?
+
+  2. What type of institution is this university (e.g., public, private, specialized,
+  etc.)?
+
+  3. What academic programs or fields of study does this university offer?
+
+  4. What is the reputation or ranking of this university?
+
+
+  ### Example 3
+
+  augmented: True
+
+  Question: Where did the director who provided the lyrics to A Time for Singing attend
+  school?
+
+  Sub-questions: 1. Who directed the film *A Time for Singing*?
+
+  2. Did the director of *A Time for Singing* also provide the lyrics for the film?
+
+  3. Where did the director of *A Time for Singing* attend school?
+
+  4. Is there any public record or biographical information about the director''s
+  education?
+
+
+  ### Example 4
+
+  augmented: True
+
+  Question: What is the record label for the person who sang Beauty and the Beast
+  with Celine Dion?
+
+  Sub-questions: 1. Who is the person who sang "Beauty and the Beast" with Celine
+  Dion?
+
+  2. What is the record label associated with that person?
+
+  3. Does the record label have any connection to the song "Beauty and the Beast"?
+
+  4. Are there any other record labels associated with the song or the artist?'

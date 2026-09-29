@@ -14,3 +14,8 @@ instructions: |
   - Is grounded only in the provided findings (do not introduce new claims).
   - Notes any material uncertainty or conflicting evidence from the findings.
   - Cites source URLs inline where they support a claim.
+
+  After your explanation, end the response with exactly one final line, with
+  nothing else on that line, giving the terse answer alone (a name, number,
+  date, or short phrase -- not a restated sentence):
+  FINAL ANSWER: <terse answer>
