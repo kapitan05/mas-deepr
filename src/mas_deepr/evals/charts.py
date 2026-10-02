@@ -104,6 +104,46 @@ def cost_latency_chart(
     return fig
 
 
+def training_progress_chart(
+    df: pl.DataFrame,
+    *,
+    benchmark: str,
+    metric: str = "score_mean",
+    models: list[str] | None = None,
+    title: str | None = None,
+) -> Figure:
+    """Line chart: x = GRPO training step, y = ``metric`` (default
+    ``score_mean``), one line per model/arm.
+
+    This is the ART-E-comparison gap named explicitly in
+    ``docs/art-e-flow-for-mas-deepr.md`` ("Gap 4b: no charting module for
+    turning logged trajectories into training-progress line charts").
+    Input is the concatenation of several ``scripts/eval_grpo_checkpoint.py``
+    runs' ``summary.parquet`` files (one row per model/benchmark, run at
+    different checkpoint steps) with a ``step`` column added -- see
+    ``scripts/watch_grpo_progress.py``, which builds exactly this frame.
+    Filtered to one ``benchmark`` at a time (call once per benchmark to
+    compare all three) rather than faceting on one axes, since the natural
+    x-axis here is step, not benchmark.
+    """
+    data = df.filter(pl.col("benchmark") == benchmark)
+    model_order = models or sorted(data["model"].unique().to_list())
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for model in model_order:
+        rows = data.filter(pl.col("model") == model).sort("step")
+        if rows.height == 0:
+            continue
+        ax.plot(rows["step"].to_list(), rows[metric].to_list(), marker="o", label=model)
+
+    ax.set_xlabel("GRPO training step")
+    ax.set_ylabel(metric)
+    ax.set_title(title or f"{benchmark}: {metric} vs. training step")
+    ax.legend(loc="best", fontsize="small")
+    fig.tight_layout()
+    return fig
+
+
 def comparison_table(df: pl.DataFrame) -> pl.DataFrame:
     """Metric x model matrix: one row per (benchmark, metric), one column
     per model. Mirrors ``benchmark_prompted_models.py``'s transposed table."""
