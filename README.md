@@ -1,5 +1,5 @@
 <div align="center">
-<img src="assets/mas-deepr-logo.jpg" alt="mas-deepr" width="420"/>
+<img src="src/mas_deepr/assets/mas-deepr-logo.jpg" alt="mas-deepr" width="420"/>
 
 # mas-deepr
 
