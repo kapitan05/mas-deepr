@@ -14,6 +14,7 @@ from mas_deepr.evals.charts import (
     accuracy_comparison_chart,
     comparison_table,
     cost_latency_chart,
+    training_progress_chart,
 )
 
 
@@ -80,3 +81,51 @@ def test_comparison_table_has_a_row_per_benchmark_metric() -> None:
         (pl.col("benchmark") == "frames") & (pl.col("metric") == "accuracy_pct")
     )
     assert acc["gpt-4.1"][0] > acc["qwen3-8b"][0]
+
+
+def _synthetic_progress_df() -> pl.DataFrame:
+    rows = []
+    for model, start, slope in (
+        ("mas-deepr-grpo", 0.15, 0.01),
+        ("mas-deepr-grpo-turns", 0.15, 0.02),
+    ):
+        for step in (1, 5, 10):
+            rows.append(
+                {
+                    "model": model,
+                    "benchmark": "frames",
+                    "step": step,
+                    "score_mean": start + slope * step,
+                }
+            )
+            rows.append(
+                {
+                    "model": model,
+                    "benchmark": "research_qa",
+                    "step": step,
+                    "score_mean": start + 0.5 * slope * step,
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def test_training_progress_chart_returns_figure() -> None:
+    fig = training_progress_chart(_synthetic_progress_df(), benchmark="frames")
+    assert isinstance(fig, Figure)
+    ax = fig.axes[0]
+    assert ax.get_legend() is not None
+    assert len(ax.lines) == 2  # one line per model/arm
+
+
+def test_training_progress_chart_filters_to_the_given_benchmark() -> None:
+    fig = training_progress_chart(_synthetic_progress_df(), benchmark="research_qa")
+    ax = fig.axes[0]
+    assert "research_qa" in ax.get_title()
+
+
+def test_training_progress_chart_sorts_by_step_not_input_order() -> None:
+    df = _synthetic_progress_df().sort("step", descending=True)
+    fig = training_progress_chart(df, benchmark="frames", models=["mas-deepr-grpo"])
+    line = fig.axes[0].lines[0]
+    xs: list[float] = list(line.get_xdata())  # type: ignore[arg-type]
+    assert xs == sorted(xs)

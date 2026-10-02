@@ -72,6 +72,18 @@ async def main() -> None:
     parser.add_argument(
         "--prefer-compiled", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable the optional W&B mirror even if WANDB_API_KEY is set",
+    )
+    parser.add_argument(
+        "--memory",
+        default="stateless",
+        help="Memory/context strategy (memory/), e.g. 'folding' -- see "
+        "docs/memory-strategies-notes.md. Previously hardcoded to "
+        "'stateless'.",
+    )
     args = parser.parse_args()
 
     import art
@@ -105,7 +117,10 @@ async def main() -> None:
     from mas_deepr.config import ModelSpec
     from mas_deepr.config.models import MODEL_REGISTRY
 
-    model_key = args.label or f"{args.model_name}-step{step}"
+    # Memory suffix goes before "-step<N>", not after, so the result still
+    # matches watch_grpo_progress.py's "<arm>-step<N>" parsing convention.
+    memory_suffix = f"-{args.memory}" if args.memory != "stateless" else ""
+    model_key = args.label or f"{args.model_name}{memory_suffix}-step{step}"
     MODEL_REGISTRY[model_key] = ModelSpec(
         key=model_key,
         model_id=inference_name,
@@ -131,7 +146,7 @@ async def main() -> None:
             milestone=milestone,
             smoke_limit=None,
             benchmark_limits=benchmark_limits,
-            memory="stateless",
+            memory=args.memory,
             invocation_id=invocation_id,
             prefer_compiled_override=args.prefer_compiled,
         )
@@ -143,6 +158,14 @@ async def main() -> None:
     out_path = out_dir / "summary.parquet"
     summary_df.write_parquet(out_path)
     print(f"\nSummary written to {out_path}")
+
+    # Was previously missing entirely -- run_milestone_eval.py's own main()
+    # calls this, but this script calls _run_one directly (see module
+    # docstring) and never reached the mirror, so no GRPO checkpoint eval
+    # ever showed up in W&B despite the sink existing and working.
+    rme._mirror_to_wandb(
+        summary_df, rme.get_settings(), milestone, disabled=args.no_wandb
+    )
 
 
 if __name__ == "__main__":
