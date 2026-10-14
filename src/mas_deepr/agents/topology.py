@@ -23,7 +23,12 @@ from typing import Any, cast
 from agent_framework import Agent, ChatOptions, FunctionTool
 from openai.types.chat.chat_completion import Choice as OpenAIChoice
 
-from mas_deepr.agents.parsing import parse_sub_questions
+from mas_deepr.agents.parsing import (
+    LEAK_FALLBACK_FINDING,
+    has_leaked_tool_call,
+    parse_sub_questions,
+    strip_leaked_tool_calls,
+)
 from mas_deepr.config import ModelSpec, Settings
 from mas_deepr.llm import build_chat_client
 from mas_deepr.llm.rate_limit import (
@@ -74,6 +79,10 @@ class ResearchPipeline:
     # run_pipeline holds one connection open for the whole run instead of
     # every tool call reconnecting (tools/mcp_client.py's module docstring).
     mcp_client: MCPToolClient | None = None
+    # Tool-less Browser used only for the one-shot leak recovery retry (C1,
+    # see _recover_leaked_finding). None (unit tests building
+    # ResearchPipeline directly) means leaks are cleaned without a retry.
+    browser_recovery: Agent | None = None
 
 
 @dataclass
@@ -94,6 +103,12 @@ class PipelineResult:
     # across passes. Only populated when run_pipeline(...,
     # capture_logprobs=True) is set -- see rl/rollout.py, the only consumer.
     role_turns: list[tuple[str, "AgentTurn"]] = field(default_factory=list)
+    # C1 leak accounting: how many Browser/Synthesizer outputs contained raw
+    # ``<tool_call>`` text, and how many of the Browser ones the tool-free
+    # recovery retry turned into a clean answer. Findings/final_answer above
+    # are always the *cleaned* text; role_turns keep the original tokens.
+    leaked_tool_calls: int = 0
+    leaks_recovered: int = 0
 
 
 def build_pipeline(
@@ -238,6 +253,18 @@ def build_pipeline(
         instructions=load_prompt("compressor", prefer_compiled=False).instructions,
         name="compressor",
     )
+    # Same Browser instructions, but no tools offered at all: the C1 recovery
+    # retry (see _recover_leaked_finding) must produce an answer, and a
+    # request with no tools in the chat template gives the model nothing to
+    # try to call -- unlike MAF's own tool_choice="none" fallback, which
+    # keeps the tools visible and is exactly where the leak comes from.
+    browser_recovery = Agent(
+        client,
+        instructions=load_prompt(
+            "browser", prefer_compiled=prefer_compiled
+        ).instructions,
+        name="browser_recovery",
+    )
     return ResearchPipeline(
         manager=manager,
         browser=browser,
@@ -247,6 +274,7 @@ def build_pipeline(
         compressor=compressor,
         tpm_limiter=build_tpm_limiter(spec.tpm_limit),
         mcp_client=mcp_client,
+        browser_recovery=browser_recovery,
     )
 
 
@@ -390,6 +418,114 @@ async def _run_agent(
     return AgentTurn(text=resp.text or "", messages=messages)
 
 
+# Caps on how much gathered tool output the recovery retry re-sends: each
+# agent.run() is a fresh conversation, so the evidence has to travel in the
+# prompt -- bounded so the retry itself can't overflow the context window.
+_RECOVERY_EVIDENCE_PER_RESULT_CHARS = 3000
+_RECOVERY_EVIDENCE_TOTAL_CHARS = 12000
+
+_RECOVERY_INSTRUCTION = (
+    "You have no tool calls left. Answer the sub-question now using only the "
+    "evidence below, which you already gathered. Do not call or mention any "
+    "tools. If the evidence is insufficient, say so briefly and give your best "
+    "answer. List the source URLs you relied on."
+)
+
+
+def _collect_tool_evidence(messages: list[object]) -> str:
+    """Concatenate the tool results a Browser call already gathered.
+
+    Reads ``function_result`` contents off the turn's MAF messages (duck-
+    typed via ``getattr``, so fake messages in tests work too), truncating
+    each result and the total -- see the ``_RECOVERY_EVIDENCE_*`` caps.
+    """
+    chunks: list[str] = []
+    total = 0
+    for message in messages:
+        for content in getattr(message, "contents", None) or []:
+            if getattr(content, "type", None) != "function_result":
+                continue
+            result = getattr(content, "result", None)
+            if not result:
+                continue
+            chunk = str(result)[:_RECOVERY_EVIDENCE_PER_RESULT_CHARS]
+            if total + len(chunk) > _RECOVERY_EVIDENCE_TOTAL_CHARS:
+                chunk = chunk[: max(0, _RECOVERY_EVIDENCE_TOTAL_CHARS - total)]
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+            if total >= _RECOVERY_EVIDENCE_TOTAL_CHARS:
+                return "\n\n---\n\n".join(chunks)
+    return "\n\n---\n\n".join(chunks)
+
+
+async def _recover_leaked_finding(
+    pipeline: ResearchPipeline,
+    *,
+    sub_question: str,
+    leaked_turn: AgentTurn,
+    result: PipelineResult,
+    question_id: str,
+    memory_strategy: str,
+    pass_index: int,
+    capture_logprobs: bool,
+) -> str:
+    """Turn a Browser finding that contains raw ``<tool_call>`` text into a
+    usable one (C1).
+
+    1. One retry on ``pipeline.browser_recovery`` (same instructions, no
+       tools offered) with the evidence the leaked call already gathered and
+       an explicit "no tool calls left, answer now" instruction.
+    2. If that's unavailable, fails, or leaks again: strip the markup from
+       the original text (then from the retry's), and if nothing is left,
+       return ``LEAK_FALLBACK_FINDING``.
+
+    The retry is recorded as its own ``"browser_recovery"`` role in both
+    telemetry and ``result.role_turns`` -- the original leaked turn stays in
+    ``role_turns`` untouched, so a GRPO trajectory still contains exactly the
+    tokens the policy generated.
+    """
+    result.leaked_tool_calls += 1
+    logger.info(
+        "browser output leaked raw tool-call text question_id=%s pass=%d",
+        question_id,
+        pass_index,
+    )
+    retry_text = ""
+    if pipeline.browser_recovery is not None:
+        evidence = _collect_tool_evidence(leaked_turn.messages)
+        prompt = (
+            f"{_RECOVERY_INSTRUCTION}\n\nSub-question: {sub_question}\n\n"
+            f"Evidence gathered:\n{evidence or '(no tool results were captured)'}"
+        )
+        try:
+            retry_turn = await _run_agent(
+                pipeline,
+                pipeline.browser_recovery,
+                prompt,
+                role="browser_recovery",
+                question_id=question_id,
+                memory_strategy=memory_strategy,
+                pass_index=pass_index,
+                capture_logprobs=capture_logprobs,
+            )
+        except Exception:
+            # Already logged + recorded in telemetry by _run_agent; a failed
+            # retry must not fail the whole question -- fall back to cleanup.
+            retry_turn = None
+        if retry_turn is not None:
+            result.role_turns.append(("browser_recovery", retry_turn))
+            retry_text = retry_turn.text
+            if retry_text.strip() and not has_leaked_tool_call(retry_text):
+                result.leaks_recovered += 1
+                return retry_text
+    return (
+        strip_leaked_tool_calls(leaked_turn.text)
+        or strip_leaked_tool_calls(retry_text)
+        or LEAK_FALLBACK_FINDING
+    )
+
+
 async def run_pipeline(
     pipeline: ResearchPipeline,
     question: str,
@@ -529,6 +665,17 @@ async def run_pipeline(
                     )
                     result.role_turns.append(("browser", browser_turn))
                     raw_finding = browser_turn.text
+                    if has_leaked_tool_call(raw_finding):
+                        raw_finding = await _recover_leaked_finding(
+                            pipeline,
+                            sub_question=sub_q,
+                            leaked_turn=browser_turn,
+                            result=result,
+                            question_id=question_id,
+                            memory_strategy=strategy.name,
+                            pass_index=pass_index,
+                            capture_logprobs=capture_logprobs,
+                        )
                     main_thread.branches.append(
                         BranchTrajectory(
                             sub_question=sub_q,
@@ -561,6 +708,18 @@ async def run_pipeline(
                 )
                 result.role_turns.append(("synthesizer", synth_turn))
                 final_answer = synth_turn.text
+                if has_leaked_tool_call(final_answer):
+                    # No retry here (the Synthesizer's only tool is optional
+                    # code exec) -- clean the markup so graders never score
+                    # raw tool-call text; role_turns keeps the original.
+                    result.leaked_tool_calls += 1
+                    logger.info(
+                        "synthesizer output leaked raw tool-call text "
+                        "question_id=%s pass=%d",
+                        question_id,
+                        pass_index,
+                    )
+                    final_answer = strip_leaked_tool_calls(final_answer)
 
                 pass_record = await strategy.finalize_pass(
                     final_answer=final_answer,

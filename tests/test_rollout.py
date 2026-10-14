@@ -642,3 +642,51 @@ async def test_rollout_fn_reward_unshaped_when_flags_default_off(
 
     assert trajectory.reward == 1.0
     assert "reward/base" not in trajectory.metrics
+
+
+def test_build_trajectory_keeps_leaked_tool_call_text_and_recovery_turn() -> None:
+    """C1: run_pipeline cleans leaked ``<tool_call>`` text out of the findings
+    it passes downstream, but the GRPO trajectory must still contain the
+    policy's original leaked output (what it really generated), followed by
+    the ``browser_recovery`` retry as its own turn."""
+    from mas_deepr.agents.topology import AgentTurn, PipelineResult
+    from mas_deepr.rl.rollout import build_trajectory_from_result
+
+    leaked = '<tool_call>\n{"name": "fetch_page", "arguments": {}}\n</tool_call>'
+    browser_turn = AgentTurn(
+        text=leaked,
+        messages=[
+            _FakeMessage("user", "Where is Paris?", []),
+            _FakeMessage("assistant", leaked, [_FakeContent("text")]),
+        ],
+    )
+    recovery_turn = AgentTurn(
+        text="Paris is in France.",
+        messages=[
+            _FakeMessage("user", "You have no tool calls left...", []),
+            _FakeMessage("assistant", "Paris is in France.", [_FakeContent("text")]),
+        ],
+    )
+    result = PipelineResult(
+        question_id="q-leak",
+        question="Where is Paris?",
+        sub_questions=["Where is Paris?"],
+        findings=["Paris is in France."],
+        final_answer="Paris",
+        role_turns=[("browser", browser_turn), ("browser_recovery", recovery_turn)],
+        leaked_tool_calls=1,
+        leaks_recovered=1,
+    )
+
+    trajectory = build_trajectory_from_result(
+        question=result.question, result=result, reward=1.0
+    )
+
+    contents = [
+        m["content"]  # type: ignore[index]
+        for m in trajectory.messages_and_choices
+        if isinstance(m, dict)
+    ]
+    assert leaked in contents
+    assert contents.index(leaked) < contents.index("Paris is in France.")
+    assert trajectory.metrics["num_role_turns"] == 2.0
