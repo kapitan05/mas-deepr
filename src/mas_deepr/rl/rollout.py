@@ -228,6 +228,15 @@ def build_trajectory_from_result(
             metadata=metadata,
         )
 
+    if result.context_stats is not None:
+        # B1 guard counters -> W&B alongside the reward/* metrics.
+        base_metrics.update(
+            {
+                f"context/{k}": float(v)
+                for k, v in result.context_stats.as_dict().items()
+            }
+        )
+
     messages_and_choices: list[_MessageOrChoice] = []
     for _role, turn in result.role_turns:
         messages_and_choices.extend(_entries_for_turn(turn))

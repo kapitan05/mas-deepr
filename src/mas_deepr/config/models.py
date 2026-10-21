@@ -44,6 +44,11 @@ class ModelSpec(BaseModel):
     # confirmed live; don't guess a number for the sake of filling the
     # field in, an absent limiter is strictly safer than a wrong one.
     tpm_limit: int | None = None
+    # Served context window in tokens, for the B1 token-budget guard
+    # (agents/context_budget.py). None => Settings.context_window_tokens
+    # (32768, the self-hosted Qwen3 vLLM max_model_len). Set this for
+    # larger-window frontier models so their requests aren't trimmed to 32k.
+    context_window_tokens: int | None = None
 
     def resolved_api_key(self) -> str | None:
         """The API key for this spec, read from ``api_key_env`` if set."""

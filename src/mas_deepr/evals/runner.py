@@ -57,6 +57,9 @@ class EvalRecord:
     # generate_benchmark itself -- there's nothing to judge, the answer
     # never happened. See generate_benchmark/grade_benchmark's split.
     graded: bool = False
+    # B1 token-budget guard counters (ContextBudgetStats.as_dict()); empty
+    # when the guard is off or for records written before B1.
+    context_stats: dict[str, int] = field(default_factory=dict)
 
 
 async def _grade(
@@ -213,6 +216,11 @@ async def generate_benchmark(
                     gold_answer=question.answer,
                     findings=result.findings,
                     graded=False,
+                    context_stats=(
+                        result.context_stats.as_dict()
+                        if result.context_stats is not None
+                        else {}
+                    ),
                 )
             except Exception as e:
                 record = EvalRecord(
@@ -294,6 +302,7 @@ async def grade_benchmark(
             graded.question = record.question
             graded.gold_answer = record.gold_answer
             graded.findings = record.findings
+            graded.context_stats = record.context_stats
             graded.cost_usd = (
                 cost_lookup(record.question_id)
                 if cost_lookup is not None

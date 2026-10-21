@@ -168,6 +168,16 @@ class Settings(BaseSettings):
     max_sub_queries: int = 4
     max_tool_calls_per_query: int = 8
 
+    # B1 token-budget guard (agents/context_budget.py): keeps every model
+    # request under the served context window by shortening the oldest
+    # Browser tool results, and caps findings/memory prefixes. Set
+    # MAS_CONTEXT_GUARD=false to reproduce pre-B1 runs exactly.
+    context_guard: bool = True
+    context_window_tokens: int = 32768  # per-model override: ModelSpec
+    context_headroom_tokens: int = 4096  # response + estimation error
+    context_finding_max_tokens: int = 3000
+    context_prefix_max_tokens: int = 6000
+
     # Paths
     data_dir: Path = PROJECT_ROOT / "assets" / "data"
     runs_dir: Path = PROJECT_ROOT / "runs"

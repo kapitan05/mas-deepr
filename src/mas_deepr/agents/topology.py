@@ -23,6 +23,15 @@ from typing import Any, cast
 from agent_framework import Agent, ChatOptions, FunctionTool
 from openai.types.chat.chat_completion import Choice as OpenAIChoice
 
+from mas_deepr.agents.context_budget import (
+    ContextBudget,
+    ContextBudgetMiddleware,
+    ContextBudgetStats,
+    chars_to_tokens,
+    current_budget_stats,
+    tokens_to_chars,
+    truncate_middle,
+)
 from mas_deepr.agents.parsing import (
     LEAK_FALLBACK_FINDING,
     has_leaked_tool_call,
@@ -83,6 +92,11 @@ class ResearchPipeline:
     # see _recover_leaked_finding). None (unit tests building
     # ResearchPipeline directly) means leaks are cleaned without a retry.
     browser_recovery: Agent | None = None
+    # B1 token-budget guard (agents/context_budget.py). None (guard off via
+    # Settings.context_guard=False, or unit tests building ResearchPipeline
+    # directly) skips the finding/prefix caps in run_pipeline entirely --
+    # byte-identical to the pre-B1 pipeline.
+    context_budget: ContextBudget | None = None
 
 
 @dataclass
@@ -109,6 +123,10 @@ class PipelineResult:
     # are always the *cleaned* text; role_turns keep the original tokens.
     leaked_tool_calls: int = 0
     leaks_recovered: int = 0
+    # B1 guard counters for this question (None when the guard is off) --
+    # see ContextBudgetStats. findings/final_answer above are what the
+    # agents actually saw (capped); raw_findings stay the full Browser text.
+    context_stats: ContextBudgetStats | None = None
 
 
 def build_pipeline(
@@ -153,12 +171,26 @@ def build_pipeline(
     )
     enabled_tools = settings.mcp_enabled_tools_set()
 
+    # B1: one guard middleware shared by every role -- it only ever shortens
+    # tool results, so on tool-less roles it just records request sizes.
+    context_budget: ContextBudget | None = None
+    guard_kwargs: dict[str, Any] = {}
+    if settings.context_guard:
+        context_budget = ContextBudget(
+            window_tokens=spec.context_window_tokens or settings.context_window_tokens,
+            headroom_tokens=settings.context_headroom_tokens,
+            finding_max_tokens=settings.context_finding_max_tokens,
+            prefix_max_tokens=settings.context_prefix_max_tokens,
+        )
+        guard_kwargs["middleware"] = [ContextBudgetMiddleware(context_budget)]
+
     manager = Agent(
         client,
         instructions=load_prompt(
             "manager", prefer_compiled=prefer_compiled
         ).instructions,
         name="manager",
+        **guard_kwargs,
     )
     # Single gate for all 6 MCP tools -- settings.mcp_enabled_tools_set().
     # Uniform on purpose: previously web_search/fetch_page were hardcoded
@@ -231,6 +263,7 @@ def build_pipeline(
         ).instructions,
         name="browser",
         tools=browser_tools,
+        **guard_kwargs,
     )
     synthesizer = Agent(
         client,
@@ -244,6 +277,7 @@ def build_pipeline(
         # as the "final answer" instead of either a real tool call or a
         # real (if unverified) answer.
         tools=[make_code_exec_tool()] if spec.supports_code_exec else [],
+        **guard_kwargs,
     )
     # Only used by memory strategies that need a compression call (e.g.
     # RE-TRAC); cheap to always build, since an unused Agent costs nothing
@@ -252,6 +286,7 @@ def build_pipeline(
         client,
         instructions=load_prompt("compressor", prefer_compiled=False).instructions,
         name="compressor",
+        **guard_kwargs,
     )
     # Same Browser instructions, but no tools offered at all: the C1 recovery
     # retry (see _recover_leaked_finding) must produce an answer, and a
@@ -264,6 +299,7 @@ def build_pipeline(
             "browser", prefer_compiled=prefer_compiled
         ).instructions,
         name="browser_recovery",
+        **guard_kwargs,
     )
     return ResearchPipeline(
         manager=manager,
@@ -275,6 +311,7 @@ def build_pipeline(
         tpm_limiter=build_tpm_limiter(spec.tpm_limit),
         mcp_client=mcp_client,
         browser_recovery=browser_recovery,
+        context_budget=context_budget,
     )
 
 
@@ -526,6 +563,36 @@ async def _recover_leaked_finding(
     )
 
 
+# B1: share of the budget kept back for the Synthesizer's own system prompt
+# (DSPy-compiled ones carry demos) when splitting the rest across findings.
+_SYNTH_RESERVE_TOKENS = 6000
+
+
+def _cap_prefix(
+    prefix: str, budget: ContextBudget | None, stats: ContextBudgetStats | None
+) -> str:
+    """Cap a memory-strategy prefix (user-message text the guard middleware
+    never touches) to ``budget.prefix_max_tokens``."""
+    if budget is None or not prefix:
+        return prefix
+    max_chars = tokens_to_chars(budget.prefix_max_tokens)
+    if len(prefix) <= max_chars:
+        return prefix
+    if stats is not None:
+        stats.prefixes_capped += 1
+    return truncate_middle(prefix, max_chars)
+
+
+def _finding_cap_chars(budget: ContextBudget, question: str, n_findings: int) -> int:
+    """Per-finding char cap: ``finding_max_tokens``, or less when that many
+    findings plus the question wouldn't fit the Synthesizer's budget."""
+    available = (
+        budget.budget_tokens - _SYNTH_RESERVE_TOKENS - chars_to_tokens(len(question))
+    )
+    per_finding = available // max(1, n_findings)
+    return tokens_to_chars(max(0, min(budget.finding_max_tokens, per_finding)))
+
+
 async def run_pipeline(
     pipeline: ResearchPipeline,
     question: str,
@@ -569,6 +636,9 @@ async def run_pipeline(
     # context, so concurrent questions don't collide; reset in `finally`
     # so the var doesn't leak into whatever reuses this task/thread next.
     token = current_question_id.set(question_id)
+    budget = pipeline.context_budget
+    stats = ContextBudgetStats() if budget is not None else None
+    stats_token = current_budget_stats.set(stats)
     try:
         async with contextlib.AsyncExitStack() as stack:
             # Hold one MCP connection open for the whole run instead of
@@ -582,6 +652,7 @@ async def run_pipeline(
                 question_id=question_id,
                 question=question,
                 memory_strategy=strategy.name,
+                context_stats=stats,
             )
             main_thread = MainThreadState(question=question)
             prior_passes: list[PassRecord] = []
@@ -605,6 +676,7 @@ async def run_pipeline(
                 pass_prefix = await strategy.prepare_pass(
                     question=question, prior_passes=prior_passes, pass_index=pass_index
                 )
+                pass_prefix = _cap_prefix(pass_prefix, budget, stats)
                 manager_prompt = (
                     f"{pass_prefix}\n\n{question}" if pass_prefix else question
                 )
@@ -643,11 +715,17 @@ async def run_pipeline(
                     pass_index,
                 )
                 pass_findings: list[str] = []
+                finding_cap_chars = (
+                    _finding_cap_chars(budget, question, len(sub_questions))
+                    if budget is not None
+                    else None
+                )
 
                 for sub_q in sub_questions:
                     branch_prefix = await strategy.prepare_branch(
                         sub_question=sub_q, main_thread=main_thread
                     )
+                    branch_prefix = _cap_prefix(branch_prefix, budget, stats)
                     browser_prompt = (
                         f"{branch_prefix}\n\n{sub_q}" if branch_prefix else sub_q
                     )
@@ -685,9 +763,20 @@ async def run_pipeline(
                     )
                     result.raw_findings.append(raw_finding)
 
+                    # B1b: what folding siblings and the Synthesizer see is
+                    # capped; raw_findings/BranchTrajectory keep the full text.
+                    finding = raw_finding
+                    if (
+                        finding_cap_chars is not None
+                        and len(finding) > finding_cap_chars
+                    ):
+                        finding = truncate_middle(finding, finding_cap_chars)
+                        if stats is not None:
+                            stats.findings_capped += 1
+
                     folded = await strategy.fold_branch(
                         sub_question=sub_q,
-                        raw_finding=raw_finding,
+                        raw_finding=finding,
                         main_thread=main_thread,
                     )
                     pass_findings.append(folded)
@@ -739,4 +828,5 @@ async def run_pipeline(
             result.pass_records = prior_passes
             return result
     finally:
+        current_budget_stats.reset(stats_token)
         current_question_id.reset(token)
