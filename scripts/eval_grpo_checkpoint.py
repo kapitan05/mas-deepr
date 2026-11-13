@@ -49,6 +49,35 @@ def _load_run_milestone_eval() -> Any:
     return module
 
 
+def checkpoint_spec(
+    *, model_key: str, inference_name: str, base_url: str | None, base_model: str
+) -> Any:
+    """ModelSpec for a trained checkpoint served by ART/W&B.
+
+    Endpoint, name and key come from ART; *behaviour* (tool-call quirks,
+    code-exec support, context window, size) from the registry entry for the
+    same base model -- e.g. a Llama 3.1 8B checkpoint keeps
+    single_tool_call_per_turn and supports_code_exec=False, exactly like its
+    pre-training eval (otherwise it 400s on multi-call turns and re-enables
+    the garbled run_python). Unknown base models keep the previous defaults
+    (family="qwen3", params_b=14). Same lookup as rl/rollout.py::rollout_fn.
+    """
+    from mas_deepr.config import ModelSpec, behaviour_for_model_id
+
+    return ModelSpec(
+        **{
+            "family": "qwen3",
+            "params_b": 14,
+            **behaviour_for_model_id(base_model),
+            "key": model_key,
+            "model_id": inference_name,
+            "self_hosted": False,
+            "api_base_url": base_url,
+            "api_key_env": "MAS_GRPO_CHECKPOINT_API_KEY",
+        }
+    )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-name", default="mas-deepr-grpo")
@@ -84,7 +113,19 @@ async def main() -> None:
         "docs/memory-strategies-notes.md. Previously hardcoded to "
         "'stateless'.",
     )
+    parser.add_argument(
+        "--r2-sync",
+        action="store_true",
+        help="When the run finishes, upload its output folder plus the W&B "
+        "run folder(s) it created to Cloudflare R2 (needs the r2 extra and "
+        "the R2 vars in .env). Failures only warn.",
+    )
     args = parser.parse_args()
+
+    from mas_deepr.config import PROJECT_ROOT, get_settings
+    from mas_deepr.storage import RunSync
+
+    r2 = RunSync(enabled=args.r2_sync, settings=get_settings(), root=PROJECT_ROOT)
 
     import art
     from art.serverless.backend import ServerlessBackend
@@ -114,21 +155,17 @@ async def main() -> None:
 
     rme = _load_run_milestone_eval()
 
-    from mas_deepr.config import ModelSpec
     from mas_deepr.config.models import MODEL_REGISTRY
 
     # Memory suffix goes before "-step<N>", not after, so the result still
     # matches watch_grpo_progress.py's "<arm>-step<N>" parsing convention.
     memory_suffix = f"-{args.memory}" if args.memory != "stateless" else ""
     model_key = args.label or f"{args.model_name}{memory_suffix}-step{step}"
-    MODEL_REGISTRY[model_key] = ModelSpec(
-        key=model_key,
-        model_id=inference_name,
-        family="qwen3",
-        self_hosted=False,
-        api_base_url=model.inference_base_url,
-        api_key_env="MAS_GRPO_CHECKPOINT_API_KEY",
-        params_b=14,
+    MODEL_REGISTRY[model_key] = checkpoint_spec(
+        model_key=model_key,
+        inference_name=inference_name,
+        base_url=model.inference_base_url,
+        base_model=args.base_model,
     )
 
     milestone = "post-grpo"
@@ -166,6 +203,7 @@ async def main() -> None:
     rme._mirror_to_wandb(
         summary_df, rme.get_settings(), milestone, disabled=args.no_wandb
     )
+    r2.finish([out_dir])
 
 
 if __name__ == "__main__":

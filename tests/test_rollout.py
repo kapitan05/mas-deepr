@@ -14,7 +14,7 @@ ART-touching tests in their own process: ``uv run pytest tests/ -m art``.
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -266,6 +266,54 @@ def _fake_judge_and_tracker() -> tuple[object, object]:
     from mas_deepr.telemetry import TelemetryTracker
 
     return cast(JudgeClient, object()), cast(TelemetryTracker, object())
+
+
+@pytest.mark.asyncio
+async def test_rollout_fn_spec_inherits_registry_behaviour_for_base_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Llama 3.1 8B rollout must get the same per-model fixes as its eval
+    spec (single_tool_call_per_turn, supports_code_exec=False) -- otherwise
+    rollouts 400 on multi-call turns and re-enable the garbled run_python."""
+    import art
+
+    from mas_deepr.config import ModelSpec
+    from mas_deepr.data.schema import Question
+    from mas_deepr.rl import rollout as rollout_mod
+
+    captured: dict[str, ModelSpec] = {}
+
+    def fake_build_pipeline(*, spec: ModelSpec, **kwargs: object) -> object:
+        captured["spec"] = spec
+        return _RecordingPipeline()
+
+    monkeypatch.setattr(rollout_mod, "build_pipeline", fake_build_pipeline)
+    monkeypatch.setattr(rollout_mod, "run_pipeline", _fake_run_pipeline)
+    _make_model(monkeypatch)  # patches get_step/get_inference_name
+    model: art.TrainableModel[Any, Any] = art.TrainableModel(
+        name="m",
+        run_name="m",
+        project="p",
+        base_model="meta-llama/Llama-3.1-8B-Instruct",
+    )
+    question = Question(
+        question_id="q1", source="musique", split="train", prompt="p", answer="Paris"
+    )
+    judge, tracker = _fake_judge_and_tracker()
+
+    await rollout_mod.rollout_fn(
+        model,
+        question,
+        judge=judge,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+    )
+
+    spec = captured["spec"]
+    assert spec.single_tool_call_per_turn is True
+    assert spec.supports_code_exec is False
+    assert spec.key == "m"  # serving identity still from ART
+    assert spec.model_id == "fake-inference-model"
+    assert spec.self_hosted is True  # -> ART's inference_base_url, not W&B Inference
 
 
 @pytest.mark.asyncio

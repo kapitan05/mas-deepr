@@ -38,6 +38,11 @@ from mas_deepr.agents.parsing import (
     parse_sub_questions,
     strip_leaked_tool_calls,
 )
+from mas_deepr.agents.tool_call_guard import (
+    ToolCallGuardMiddleware,
+    ToolGuardStats,
+    current_tool_guard_stats,
+)
 from mas_deepr.config import ModelSpec, Settings
 from mas_deepr.llm import build_chat_client
 from mas_deepr.llm.rate_limit import (
@@ -127,6 +132,10 @@ class PipelineResult:
     # see ContextBudgetStats. findings/final_answer above are what the
     # agents actually saw (capped); raw_findings stay the full Browser text.
     context_stats: ContextBudgetStats | None = None
+    # Tool-call guard counters (agents/tool_call_guard.py): budget-exhausted
+    # final turns sent without tools, and text-form calls turned into real
+    # ones. Always set by run_pipeline.
+    tool_guard_stats: ToolGuardStats | None = None
 
 
 def build_pipeline(
@@ -152,14 +161,24 @@ def build_pipeline(
             "role needs the prompted-JSON-tools fallback (plan Stage G, not "
             "built yet). Pick a tool-calling model or implement the fallback."
         )
+    client_kwargs: dict[str, Any] = {}
     if trainable:
         from mas_deepr.rl.trainable_client import TrainableOpenAIChatCompletionClient
 
-        client = build_chat_client(
-            spec, settings, client_cls=TrainableOpenAIChatCompletionClient
-        )
-    else:
-        client = build_chat_client(spec, settings)
+        client_kwargs["client_cls"] = TrainableOpenAIChatCompletionClient
+    client = build_chat_client(spec, settings, **client_kwargs)
+    # The Browser gets its own client instance so its tool-call budget can
+    # be enforced where MAF actually reads it: the client's
+    # function_invocation_configuration. (Passing max_function_calls via
+    # agent.run(function_invocation_kwargs=...) does NOT limit anything in
+    # agent-framework 1.11 -- those kwargs are forwarded to the tools as
+    # extra arguments; confirmed live, the loop ran to its default 40
+    # iterations.) _run_agent re-applies the per-run value before each
+    # Browser call.
+    browser_client = build_chat_client(spec, settings, **client_kwargs)
+    browser_client.function_invocation_configuration["max_function_calls"] = (
+        settings.max_tool_calls_per_query
+    )
     # Tool calls proxy through the MCP backend (mcp_backend/, run via
     # scripts/run_mcp_server.py) instead of calling providers in-process --
     # see docs/dr-tulu-agent-infra.md and the MCP-adoption plan.
@@ -183,6 +202,17 @@ def build_pipeline(
             prefix_max_tokens=settings.context_prefix_max_tokens,
         )
         guard_kwargs["middleware"] = [ContextBudgetMiddleware(context_budget)]
+    # Tool-call guard (agents/tool_call_guard.py) on every role that has
+    # tools, listed first so it removes tools on the budget-exhausted turn
+    # before the budget guard estimates that request's size.
+    tool_role_kwargs: dict[str, Any] = {
+        "middleware": [
+            ToolCallGuardMiddleware(
+                single_tool_call_per_turn=spec.single_tool_call_per_turn
+            ),
+            *guard_kwargs.get("middleware", []),
+        ]
+    }
 
     manager = Agent(
         client,
@@ -257,13 +287,13 @@ def build_pipeline(
         factory() for name, factory in tool_factories if name in enabled_tools
     ]
     browser = Agent(
-        client,
+        browser_client,
         instructions=load_prompt(
             "browser", prefer_compiled=prefer_compiled
         ).instructions,
         name="browser",
         tools=browser_tools,
-        **guard_kwargs,
+        **tool_role_kwargs,
     )
     synthesizer = Agent(
         client,
@@ -277,7 +307,7 @@ def build_pipeline(
         # as the "final answer" instead of either a real tool call or a
         # real (if unverified) answer.
         tools=[make_code_exec_tool()] if spec.supports_code_exec else [],
-        **guard_kwargs,
+        **tool_role_kwargs,
     )
     # Only used by memory strategies that need a compression call (e.g.
     # RE-TRAC); cheap to always build, since an unused Agent costs nothing
@@ -376,11 +406,17 @@ async def _run_agent(
     pass_index: int | None = None,
     capture_logprobs: bool = False,
 ) -> AgentTurn:
-    invocation_kwargs = (
-        {"max_function_calls": max_function_calls}
-        if max_function_calls is not None
-        else None
-    )
+    if max_function_calls is not None:
+        # The real budget (see build_pipeline): MAF reads it from the
+        # client's function_invocation_configuration. Same value for every
+        # call in a run, so setting it on the shared Browser client is
+        # race-free across concurrent questions. Fake test agents have no
+        # client -- skipped.
+        config = getattr(
+            getattr(agent, "client", None), "function_invocation_configuration", None
+        )
+        if isinstance(config, dict):
+            config["max_function_calls"] = max_function_calls
     # Only requested for GRPO rollouts (rl/rollout.py) -- eval/baseline
     # callers never set this, so their inference cost/latency is unaffected.
     # extra_body={"return_token_ids": True} is a real vLLM OpenAI-compatible
@@ -406,11 +442,7 @@ async def _run_agent(
     await pipeline.tpm_limiter.acquire(estimate_tokens(prompt))
     with Timer() as t:
         try:
-            resp = await agent.run(
-                prompt,
-                function_invocation_kwargs=invocation_kwargs,
-                options=run_options,
-            )
+            resp = await agent.run(prompt, options=run_options)
         except Exception as e:
             logger.warning(
                 "agent call failed role=%s question_id=%s error=%s: %s",
@@ -639,6 +671,8 @@ async def run_pipeline(
     budget = pipeline.context_budget
     stats = ContextBudgetStats() if budget is not None else None
     stats_token = current_budget_stats.set(stats)
+    tool_stats = ToolGuardStats()
+    tool_stats_token = current_tool_guard_stats.set(tool_stats)
     try:
         async with contextlib.AsyncExitStack() as stack:
             # Hold one MCP connection open for the whole run instead of
@@ -653,6 +687,7 @@ async def run_pipeline(
                 question=question,
                 memory_strategy=strategy.name,
                 context_stats=stats,
+                tool_guard_stats=tool_stats,
             )
             main_thread = MainThreadState(question=question)
             prior_passes: list[PassRecord] = []
@@ -828,5 +863,6 @@ async def run_pipeline(
             result.pass_records = prior_passes
             return result
     finally:
+        current_tool_guard_stats.reset(tool_stats_token)
         current_budget_stats.reset(stats_token)
         current_question_id.reset(token)

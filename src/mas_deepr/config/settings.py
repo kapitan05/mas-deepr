@@ -108,6 +108,18 @@ class Settings(BaseSettings):
         "web_search,fetch_page,wikipedia_search,semantic_scholar_search,pubmed_search"
     )
     searxng_base_url: str = Field(default="", validation_alias="SEARXNG_BASE_URL")
+    # Cloudflare R2 (S3-compatible) archive for local run outputs -- see
+    # storage/r2.py and scripts/sync_to_r2.py. Read under their own
+    # conventional names (not MAS_-prefixed), like TAVILY_API_KEY. Empty =>
+    # R2 sync is unavailable and says which of these is missing.
+    cloudflare_account_id: str = Field(
+        default="", validation_alias="CLOUDFLARE_ACCOUNT_ID"
+    )
+    r2_access_key_id: str = Field(default="", validation_alias="R2_ACCESS_KEY_ID")
+    r2_secret_access_key: str = Field(
+        default="", validation_alias="R2_SECRET_ACCESS_KEY", repr=False
+    )
+    r2_bucket_name: str = Field(default="", validation_alias="R2_BUCKET_NAME")
     semantic_scholar_api_key: str = Field(
         default="", validation_alias="SEMANTIC_SCHOLAR_API_KEY"
     )
