@@ -22,7 +22,7 @@ import logging
 import uuid
 
 from mas_deepr.agents import build_pipeline
-from mas_deepr.config import get_model, get_settings
+from mas_deepr.config import PROJECT_ROOT, get_model, get_settings
 from mas_deepr.data import load_browsecomp, load_frames, load_research_rubrics
 from mas_deepr.evals import (
     JudgeClient,
@@ -33,6 +33,7 @@ from mas_deepr.evals import (
 )
 from mas_deepr.logging_config import configure_logging
 from mas_deepr.memory import MEMORY_REGISTRY, get_memory_strategy
+from mas_deepr.storage import RunSync
 from mas_deepr.telemetry import TelemetryTracker
 
 _BENCHMARK_LOADERS = {
@@ -61,6 +62,13 @@ async def main() -> None:
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
+        "--r2-sync",
+        action="store_true",
+        help="When the run finishes, upload its output folder plus the W&B "
+        "run folder(s) it created to Cloudflare R2 (needs the r2 extra and "
+        "the R2 vars in .env). Failures only warn.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume the same --model/--benchmark's previous dev run instead of "
@@ -74,6 +82,7 @@ async def main() -> None:
     configure_logging(logging.getLevelName(args.log_level.upper()))
     settings = get_settings()
     settings.ensure_dirs()
+    r2 = RunSync(enabled=args.r2_sync, settings=settings, root=PROJECT_ROOT)
     spec = get_model(args.model)
 
     # --resume needs a *stable* id to find the same output path again next
@@ -143,6 +152,7 @@ async def main() -> None:
     write_results(records, results_path)
     print(f"Results written to {results_path}")
     print(f"Telemetry written to {telemetry_path}")
+    r2.finish([settings.runs_dir / f"dev-{run_id}"])
 
 
 if __name__ == "__main__":

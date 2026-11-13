@@ -8,6 +8,7 @@ thesis.
 """
 
 import os
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -44,6 +45,19 @@ class ModelSpec(BaseModel):
     # confirmed live; don't guess a number for the sake of filling the
     # field in, an absent limiter is strictly safer than a wrong one.
     tpm_limit: int | None = None
+    # Served context window in tokens, for the B1 token-budget guard
+    # (agents/context_budget.py). None => Settings.context_window_tokens
+    # (32768, the self-hosted Qwen3 vLLM max_model_len). Set this for
+    # larger-window frontier models so their requests aren't trimmed to 32k.
+    context_window_tokens: int | None = None
+    # True => the model's chat template accepts only ONE tool call per
+    # assistant turn (Llama 3.1's official template raises "This model only
+    # supports single tool-calls at once!" on a multi-call turn in the
+    # history -- confirmed live on W&B Inference as a 400 on the request
+    # *after* the multi-call turn). agents/tool_call_guard.py then keeps
+    # only the first call of any multi-call reply, so the history always
+    # stays renderable.
+    single_tool_call_per_turn: bool = False
 
     def resolved_api_key(self) -> str | None:
         """The API key for this spec, read from ``api_key_env`` if set."""
@@ -214,6 +228,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             # fetch_page tool calls work fine for this model, just not
             # run_python. See supports_code_exec's docstring above.
             supports_code_exec=False,
+            single_tool_call_per_turn=True,
         ),
         ModelSpec(
             key="granite-4.2-8b-wandb",
@@ -267,6 +282,36 @@ def get_model(key: str) -> ModelSpec:
         return MODEL_REGISTRY[key]
     except KeyError as e:
         raise KeyError(f"Unknown model '{key}'. Known: {sorted(MODEL_REGISTRY)}") from e
+
+
+# How a model *behaves* (tool-calling quirks, context window) -- as opposed
+# to where/how it's served (endpoint, key) and priced. These follow the
+# model's weights wherever they're served, so a GRPO rollout against ART's
+# endpoint must inherit them from the registry entry for the same base
+# model -- see behaviour_for_model_id.
+_BEHAVIOUR_FIELDS = (
+    "family",
+    "params_b",
+    "supports_native_tools",
+    "supports_code_exec",
+    "single_tool_call_per_turn",
+    "context_window_tokens",
+)
+
+
+def behaviour_for_model_id(model_id: str) -> dict[str, Any]:
+    """Behaviour flags of the registry entry serving ``model_id`` (exact HF
+    id match, e.g. ``meta-llama/Llama-3.1-8B-Instruct`` ->
+    ``llama-3.1-8b-wandb``'s flags), or ``{}`` if no entry serves it.
+
+    Used by ``rl/rollout.py::rollout_fn``, which has to build its own spec
+    (ART's endpoint and checkpoint name) but must not lose per-model fixes
+    like ``single_tool_call_per_turn`` / ``supports_code_exec=False``.
+    """
+    for spec in MODEL_REGISTRY.values():
+        if spec.model_id == model_id:
+            return {f: getattr(spec, f) for f in _BEHAVIOUR_FIELDS}
+    return {}
 
 
 def cost_usd(spec: ModelSpec, input_tokens: int, output_tokens: int) -> float:

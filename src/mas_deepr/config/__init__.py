@@ -1,4 +1,10 @@
-from mas_deepr.config.models import MODEL_REGISTRY, ModelSpec, cost_usd, get_model
+from mas_deepr.config.models import (
+    MODEL_REGISTRY,
+    ModelSpec,
+    behaviour_for_model_id,
+    cost_usd,
+    get_model,
+)
 from mas_deepr.config.settings import PROJECT_ROOT, Settings, get_settings
 from mas_deepr.config.tool_scopes import TOOL_SCOPES, get_tool_scope
 
@@ -8,6 +14,7 @@ __all__ = [
     "TOOL_SCOPES",
     "ModelSpec",
     "Settings",
+    "behaviour_for_model_id",
     "cost_usd",
     "get_model",
     "get_settings",
