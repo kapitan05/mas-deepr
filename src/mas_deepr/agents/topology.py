@@ -23,7 +23,26 @@ from typing import Any, cast
 from agent_framework import Agent, ChatOptions, FunctionTool
 from openai.types.chat.chat_completion import Choice as OpenAIChoice
 
-from mas_deepr.agents.parsing import parse_sub_questions
+from mas_deepr.agents.context_budget import (
+    ContextBudget,
+    ContextBudgetMiddleware,
+    ContextBudgetStats,
+    chars_to_tokens,
+    current_budget_stats,
+    tokens_to_chars,
+    truncate_middle,
+)
+from mas_deepr.agents.parsing import (
+    LEAK_FALLBACK_FINDING,
+    has_leaked_tool_call,
+    parse_sub_questions,
+    strip_leaked_tool_calls,
+)
+from mas_deepr.agents.tool_call_guard import (
+    ToolCallGuardMiddleware,
+    ToolGuardStats,
+    current_tool_guard_stats,
+)
 from mas_deepr.config import ModelSpec, Settings
 from mas_deepr.llm import build_chat_client
 from mas_deepr.llm.rate_limit import (
@@ -74,6 +93,15 @@ class ResearchPipeline:
     # run_pipeline holds one connection open for the whole run instead of
     # every tool call reconnecting (tools/mcp_client.py's module docstring).
     mcp_client: MCPToolClient | None = None
+    # Tool-less Browser used only for the one-shot leak recovery retry (C1,
+    # see _recover_leaked_finding). None (unit tests building
+    # ResearchPipeline directly) means leaks are cleaned without a retry.
+    browser_recovery: Agent | None = None
+    # B1 token-budget guard (agents/context_budget.py). None (guard off via
+    # Settings.context_guard=False, or unit tests building ResearchPipeline
+    # directly) skips the finding/prefix caps in run_pipeline entirely --
+    # byte-identical to the pre-B1 pipeline.
+    context_budget: ContextBudget | None = None
 
 
 @dataclass
@@ -94,6 +122,20 @@ class PipelineResult:
     # across passes. Only populated when run_pipeline(...,
     # capture_logprobs=True) is set -- see rl/rollout.py, the only consumer.
     role_turns: list[tuple[str, "AgentTurn"]] = field(default_factory=list)
+    # C1 leak accounting: how many Browser/Synthesizer outputs contained raw
+    # ``<tool_call>`` text, and how many of the Browser ones the tool-free
+    # recovery retry turned into a clean answer. Findings/final_answer above
+    # are always the *cleaned* text; role_turns keep the original tokens.
+    leaked_tool_calls: int = 0
+    leaks_recovered: int = 0
+    # B1 guard counters for this question (None when the guard is off) --
+    # see ContextBudgetStats. findings/final_answer above are what the
+    # agents actually saw (capped); raw_findings stay the full Browser text.
+    context_stats: ContextBudgetStats | None = None
+    # Tool-call guard counters (agents/tool_call_guard.py): budget-exhausted
+    # final turns sent without tools, and text-form calls turned into real
+    # ones. Always set by run_pipeline.
+    tool_guard_stats: ToolGuardStats | None = None
 
 
 def build_pipeline(
@@ -119,14 +161,24 @@ def build_pipeline(
             "role needs the prompted-JSON-tools fallback (plan Stage G, not "
             "built yet). Pick a tool-calling model or implement the fallback."
         )
+    client_kwargs: dict[str, Any] = {}
     if trainable:
         from mas_deepr.rl.trainable_client import TrainableOpenAIChatCompletionClient
 
-        client = build_chat_client(
-            spec, settings, client_cls=TrainableOpenAIChatCompletionClient
-        )
-    else:
-        client = build_chat_client(spec, settings)
+        client_kwargs["client_cls"] = TrainableOpenAIChatCompletionClient
+    client = build_chat_client(spec, settings, **client_kwargs)
+    # The Browser gets its own client instance so its tool-call budget can
+    # be enforced where MAF actually reads it: the client's
+    # function_invocation_configuration. (Passing max_function_calls via
+    # agent.run(function_invocation_kwargs=...) does NOT limit anything in
+    # agent-framework 1.11 -- those kwargs are forwarded to the tools as
+    # extra arguments; confirmed live, the loop ran to its default 40
+    # iterations.) _run_agent re-applies the per-run value before each
+    # Browser call.
+    browser_client = build_chat_client(spec, settings, **client_kwargs)
+    browser_client.function_invocation_configuration["max_function_calls"] = (
+        settings.max_tool_calls_per_query
+    )
     # Tool calls proxy through the MCP backend (mcp_backend/, run via
     # scripts/run_mcp_server.py) instead of calling providers in-process --
     # see docs/dr-tulu-agent-infra.md and the MCP-adoption plan.
@@ -138,12 +190,37 @@ def build_pipeline(
     )
     enabled_tools = settings.mcp_enabled_tools_set()
 
+    # B1: one guard middleware shared by every role -- it only ever shortens
+    # tool results, so on tool-less roles it just records request sizes.
+    context_budget: ContextBudget | None = None
+    guard_kwargs: dict[str, Any] = {}
+    if settings.context_guard:
+        context_budget = ContextBudget(
+            window_tokens=spec.context_window_tokens or settings.context_window_tokens,
+            headroom_tokens=settings.context_headroom_tokens,
+            finding_max_tokens=settings.context_finding_max_tokens,
+            prefix_max_tokens=settings.context_prefix_max_tokens,
+        )
+        guard_kwargs["middleware"] = [ContextBudgetMiddleware(context_budget)]
+    # Tool-call guard (agents/tool_call_guard.py) on every role that has
+    # tools, listed first so it removes tools on the budget-exhausted turn
+    # before the budget guard estimates that request's size.
+    tool_role_kwargs: dict[str, Any] = {
+        "middleware": [
+            ToolCallGuardMiddleware(
+                single_tool_call_per_turn=spec.single_tool_call_per_turn
+            ),
+            *guard_kwargs.get("middleware", []),
+        ]
+    }
+
     manager = Agent(
         client,
         instructions=load_prompt(
             "manager", prefer_compiled=prefer_compiled
         ).instructions,
         name="manager",
+        **guard_kwargs,
     )
     # Single gate for all 6 MCP tools -- settings.mcp_enabled_tools_set().
     # Uniform on purpose: previously web_search/fetch_page were hardcoded
@@ -210,12 +287,13 @@ def build_pipeline(
         factory() for name, factory in tool_factories if name in enabled_tools
     ]
     browser = Agent(
-        client,
+        browser_client,
         instructions=load_prompt(
             "browser", prefer_compiled=prefer_compiled
         ).instructions,
         name="browser",
         tools=browser_tools,
+        **tool_role_kwargs,
     )
     synthesizer = Agent(
         client,
@@ -229,6 +307,7 @@ def build_pipeline(
         # as the "final answer" instead of either a real tool call or a
         # real (if unverified) answer.
         tools=[make_code_exec_tool()] if spec.supports_code_exec else [],
+        **tool_role_kwargs,
     )
     # Only used by memory strategies that need a compression call (e.g.
     # RE-TRAC); cheap to always build, since an unused Agent costs nothing
@@ -237,6 +316,20 @@ def build_pipeline(
         client,
         instructions=load_prompt("compressor", prefer_compiled=False).instructions,
         name="compressor",
+        **guard_kwargs,
+    )
+    # Same Browser instructions, but no tools offered at all: the C1 recovery
+    # retry (see _recover_leaked_finding) must produce an answer, and a
+    # request with no tools in the chat template gives the model nothing to
+    # try to call -- unlike MAF's own tool_choice="none" fallback, which
+    # keeps the tools visible and is exactly where the leak comes from.
+    browser_recovery = Agent(
+        client,
+        instructions=load_prompt(
+            "browser", prefer_compiled=prefer_compiled
+        ).instructions,
+        name="browser_recovery",
+        **guard_kwargs,
     )
     return ResearchPipeline(
         manager=manager,
@@ -247,6 +340,8 @@ def build_pipeline(
         compressor=compressor,
         tpm_limiter=build_tpm_limiter(spec.tpm_limit),
         mcp_client=mcp_client,
+        browser_recovery=browser_recovery,
+        context_budget=context_budget,
     )
 
 
@@ -311,11 +406,17 @@ async def _run_agent(
     pass_index: int | None = None,
     capture_logprobs: bool = False,
 ) -> AgentTurn:
-    invocation_kwargs = (
-        {"max_function_calls": max_function_calls}
-        if max_function_calls is not None
-        else None
-    )
+    if max_function_calls is not None:
+        # The real budget (see build_pipeline): MAF reads it from the
+        # client's function_invocation_configuration. Same value for every
+        # call in a run, so setting it on the shared Browser client is
+        # race-free across concurrent questions. Fake test agents have no
+        # client -- skipped.
+        config = getattr(
+            getattr(agent, "client", None), "function_invocation_configuration", None
+        )
+        if isinstance(config, dict):
+            config["max_function_calls"] = max_function_calls
     # Only requested for GRPO rollouts (rl/rollout.py) -- eval/baseline
     # callers never set this, so their inference cost/latency is unaffected.
     # extra_body={"return_token_ids": True} is a real vLLM OpenAI-compatible
@@ -341,11 +442,7 @@ async def _run_agent(
     await pipeline.tpm_limiter.acquire(estimate_tokens(prompt))
     with Timer() as t:
         try:
-            resp = await agent.run(
-                prompt,
-                function_invocation_kwargs=invocation_kwargs,
-                options=run_options,
-            )
+            resp = await agent.run(prompt, options=run_options)
         except Exception as e:
             logger.warning(
                 "agent call failed role=%s question_id=%s error=%s: %s",
@@ -388,6 +485,144 @@ async def _run_agent(
     )
     messages = list(getattr(resp, "messages", None) or [])
     return AgentTurn(text=resp.text or "", messages=messages)
+
+
+# Caps on how much gathered tool output the recovery retry re-sends: each
+# agent.run() is a fresh conversation, so the evidence has to travel in the
+# prompt -- bounded so the retry itself can't overflow the context window.
+_RECOVERY_EVIDENCE_PER_RESULT_CHARS = 3000
+_RECOVERY_EVIDENCE_TOTAL_CHARS = 12000
+
+_RECOVERY_INSTRUCTION = (
+    "You have no tool calls left. Answer the sub-question now using only the "
+    "evidence below, which you already gathered. Do not call or mention any "
+    "tools. If the evidence is insufficient, say so briefly and give your best "
+    "answer. List the source URLs you relied on."
+)
+
+
+def _collect_tool_evidence(messages: list[object]) -> str:
+    """Concatenate the tool results a Browser call already gathered.
+
+    Reads ``function_result`` contents off the turn's MAF messages (duck-
+    typed via ``getattr``, so fake messages in tests work too), truncating
+    each result and the total -- see the ``_RECOVERY_EVIDENCE_*`` caps.
+    """
+    chunks: list[str] = []
+    total = 0
+    for message in messages:
+        for content in getattr(message, "contents", None) or []:
+            if getattr(content, "type", None) != "function_result":
+                continue
+            result = getattr(content, "result", None)
+            if not result:
+                continue
+            chunk = str(result)[:_RECOVERY_EVIDENCE_PER_RESULT_CHARS]
+            if total + len(chunk) > _RECOVERY_EVIDENCE_TOTAL_CHARS:
+                chunk = chunk[: max(0, _RECOVERY_EVIDENCE_TOTAL_CHARS - total)]
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+            if total >= _RECOVERY_EVIDENCE_TOTAL_CHARS:
+                return "\n\n---\n\n".join(chunks)
+    return "\n\n---\n\n".join(chunks)
+
+
+async def _recover_leaked_finding(
+    pipeline: ResearchPipeline,
+    *,
+    sub_question: str,
+    leaked_turn: AgentTurn,
+    result: PipelineResult,
+    question_id: str,
+    memory_strategy: str,
+    pass_index: int,
+    capture_logprobs: bool,
+) -> str:
+    """Turn a Browser finding that contains raw ``<tool_call>`` text into a
+    usable one (C1).
+
+    1. One retry on ``pipeline.browser_recovery`` (same instructions, no
+       tools offered) with the evidence the leaked call already gathered and
+       an explicit "no tool calls left, answer now" instruction.
+    2. If that's unavailable, fails, or leaks again: strip the markup from
+       the original text (then from the retry's), and if nothing is left,
+       return ``LEAK_FALLBACK_FINDING``.
+
+    The retry is recorded as its own ``"browser_recovery"`` role in both
+    telemetry and ``result.role_turns`` -- the original leaked turn stays in
+    ``role_turns`` untouched, so a GRPO trajectory still contains exactly the
+    tokens the policy generated.
+    """
+    result.leaked_tool_calls += 1
+    logger.info(
+        "browser output leaked raw tool-call text question_id=%s pass=%d",
+        question_id,
+        pass_index,
+    )
+    retry_text = ""
+    if pipeline.browser_recovery is not None:
+        evidence = _collect_tool_evidence(leaked_turn.messages)
+        prompt = (
+            f"{_RECOVERY_INSTRUCTION}\n\nSub-question: {sub_question}\n\n"
+            f"Evidence gathered:\n{evidence or '(no tool results were captured)'}"
+        )
+        try:
+            retry_turn = await _run_agent(
+                pipeline,
+                pipeline.browser_recovery,
+                prompt,
+                role="browser_recovery",
+                question_id=question_id,
+                memory_strategy=memory_strategy,
+                pass_index=pass_index,
+                capture_logprobs=capture_logprobs,
+            )
+        except Exception:
+            # Already logged + recorded in telemetry by _run_agent; a failed
+            # retry must not fail the whole question -- fall back to cleanup.
+            retry_turn = None
+        if retry_turn is not None:
+            result.role_turns.append(("browser_recovery", retry_turn))
+            retry_text = retry_turn.text
+            if retry_text.strip() and not has_leaked_tool_call(retry_text):
+                result.leaks_recovered += 1
+                return retry_text
+    return (
+        strip_leaked_tool_calls(leaked_turn.text)
+        or strip_leaked_tool_calls(retry_text)
+        or LEAK_FALLBACK_FINDING
+    )
+
+
+# B1: share of the budget kept back for the Synthesizer's own system prompt
+# (DSPy-compiled ones carry demos) when splitting the rest across findings.
+_SYNTH_RESERVE_TOKENS = 6000
+
+
+def _cap_prefix(
+    prefix: str, budget: ContextBudget | None, stats: ContextBudgetStats | None
+) -> str:
+    """Cap a memory-strategy prefix (user-message text the guard middleware
+    never touches) to ``budget.prefix_max_tokens``."""
+    if budget is None or not prefix:
+        return prefix
+    max_chars = tokens_to_chars(budget.prefix_max_tokens)
+    if len(prefix) <= max_chars:
+        return prefix
+    if stats is not None:
+        stats.prefixes_capped += 1
+    return truncate_middle(prefix, max_chars)
+
+
+def _finding_cap_chars(budget: ContextBudget, question: str, n_findings: int) -> int:
+    """Per-finding char cap: ``finding_max_tokens``, or less when that many
+    findings plus the question wouldn't fit the Synthesizer's budget."""
+    available = (
+        budget.budget_tokens - _SYNTH_RESERVE_TOKENS - chars_to_tokens(len(question))
+    )
+    per_finding = available // max(1, n_findings)
+    return tokens_to_chars(max(0, min(budget.finding_max_tokens, per_finding)))
 
 
 async def run_pipeline(
@@ -433,6 +668,11 @@ async def run_pipeline(
     # context, so concurrent questions don't collide; reset in `finally`
     # so the var doesn't leak into whatever reuses this task/thread next.
     token = current_question_id.set(question_id)
+    budget = pipeline.context_budget
+    stats = ContextBudgetStats() if budget is not None else None
+    stats_token = current_budget_stats.set(stats)
+    tool_stats = ToolGuardStats()
+    tool_stats_token = current_tool_guard_stats.set(tool_stats)
     try:
         async with contextlib.AsyncExitStack() as stack:
             # Hold one MCP connection open for the whole run instead of
@@ -446,6 +686,8 @@ async def run_pipeline(
                 question_id=question_id,
                 question=question,
                 memory_strategy=strategy.name,
+                context_stats=stats,
+                tool_guard_stats=tool_stats,
             )
             main_thread = MainThreadState(question=question)
             prior_passes: list[PassRecord] = []
@@ -469,6 +711,7 @@ async def run_pipeline(
                 pass_prefix = await strategy.prepare_pass(
                     question=question, prior_passes=prior_passes, pass_index=pass_index
                 )
+                pass_prefix = _cap_prefix(pass_prefix, budget, stats)
                 manager_prompt = (
                     f"{pass_prefix}\n\n{question}" if pass_prefix else question
                 )
@@ -507,11 +750,17 @@ async def run_pipeline(
                     pass_index,
                 )
                 pass_findings: list[str] = []
+                finding_cap_chars = (
+                    _finding_cap_chars(budget, question, len(sub_questions))
+                    if budget is not None
+                    else None
+                )
 
                 for sub_q in sub_questions:
                     branch_prefix = await strategy.prepare_branch(
                         sub_question=sub_q, main_thread=main_thread
                     )
+                    branch_prefix = _cap_prefix(branch_prefix, budget, stats)
                     browser_prompt = (
                         f"{branch_prefix}\n\n{sub_q}" if branch_prefix else sub_q
                     )
@@ -529,6 +778,17 @@ async def run_pipeline(
                     )
                     result.role_turns.append(("browser", browser_turn))
                     raw_finding = browser_turn.text
+                    if has_leaked_tool_call(raw_finding):
+                        raw_finding = await _recover_leaked_finding(
+                            pipeline,
+                            sub_question=sub_q,
+                            leaked_turn=browser_turn,
+                            result=result,
+                            question_id=question_id,
+                            memory_strategy=strategy.name,
+                            pass_index=pass_index,
+                            capture_logprobs=capture_logprobs,
+                        )
                     main_thread.branches.append(
                         BranchTrajectory(
                             sub_question=sub_q,
@@ -538,9 +798,20 @@ async def run_pipeline(
                     )
                     result.raw_findings.append(raw_finding)
 
+                    # B1b: what folding siblings and the Synthesizer see is
+                    # capped; raw_findings/BranchTrajectory keep the full text.
+                    finding = raw_finding
+                    if (
+                        finding_cap_chars is not None
+                        and len(finding) > finding_cap_chars
+                    ):
+                        finding = truncate_middle(finding, finding_cap_chars)
+                        if stats is not None:
+                            stats.findings_capped += 1
+
                     folded = await strategy.fold_branch(
                         sub_question=sub_q,
-                        raw_finding=raw_finding,
+                        raw_finding=finding,
                         main_thread=main_thread,
                     )
                     pass_findings.append(folded)
@@ -561,6 +832,18 @@ async def run_pipeline(
                 )
                 result.role_turns.append(("synthesizer", synth_turn))
                 final_answer = synth_turn.text
+                if has_leaked_tool_call(final_answer):
+                    # No retry here (the Synthesizer's only tool is optional
+                    # code exec) -- clean the markup so graders never score
+                    # raw tool-call text; role_turns keeps the original.
+                    result.leaked_tool_calls += 1
+                    logger.info(
+                        "synthesizer output leaked raw tool-call text "
+                        "question_id=%s pass=%d",
+                        question_id,
+                        pass_index,
+                    )
+                    final_answer = strip_leaked_tool_calls(final_answer)
 
                 pass_record = await strategy.finalize_pass(
                     final_answer=final_answer,
@@ -580,4 +863,6 @@ async def run_pipeline(
             result.pass_records = prior_passes
             return result
     finally:
+        current_tool_guard_stats.reset(tool_stats_token)
+        current_budget_stats.reset(stats_token)
         current_question_id.reset(token)

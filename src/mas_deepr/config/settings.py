@@ -108,6 +108,18 @@ class Settings(BaseSettings):
         "web_search,fetch_page,wikipedia_search,semantic_scholar_search,pubmed_search"
     )
     searxng_base_url: str = Field(default="", validation_alias="SEARXNG_BASE_URL")
+    # Cloudflare R2 (S3-compatible) archive for local run outputs -- see
+    # storage/r2.py and scripts/sync_to_r2.py. Read under their own
+    # conventional names (not MAS_-prefixed), like TAVILY_API_KEY. Empty =>
+    # R2 sync is unavailable and says which of these is missing.
+    cloudflare_account_id: str = Field(
+        default="", validation_alias="CLOUDFLARE_ACCOUNT_ID"
+    )
+    r2_access_key_id: str = Field(default="", validation_alias="R2_ACCESS_KEY_ID")
+    r2_secret_access_key: str = Field(
+        default="", validation_alias="R2_SECRET_ACCESS_KEY", repr=False
+    )
+    r2_bucket_name: str = Field(default="", validation_alias="R2_BUCKET_NAME")
     semantic_scholar_api_key: str = Field(
         default="", validation_alias="SEMANTIC_SCHOLAR_API_KEY"
     )
@@ -167,6 +179,16 @@ class Settings(BaseSettings):
     # Agent loop limits
     max_sub_queries: int = 4
     max_tool_calls_per_query: int = 8
+
+    # B1 token-budget guard (agents/context_budget.py): keeps every model
+    # request under the served context window by shortening the oldest
+    # Browser tool results, and caps findings/memory prefixes. Set
+    # MAS_CONTEXT_GUARD=false to reproduce pre-B1 runs exactly.
+    context_guard: bool = True
+    context_window_tokens: int = 32768  # per-model override: ModelSpec
+    context_headroom_tokens: int = 4096  # response + estimation error
+    context_finding_max_tokens: int = 3000
+    context_prefix_max_tokens: int = 6000
 
     # Paths
     data_dir: Path = PROJECT_ROOT / "assets" / "data"

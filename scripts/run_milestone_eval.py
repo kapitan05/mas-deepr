@@ -30,7 +30,13 @@ import uuid
 import polars as pl
 
 from mas_deepr.agents import ResearchPipeline, build_pipeline
-from mas_deepr.config import Settings, get_model, get_settings, get_tool_scope
+from mas_deepr.config import (
+    PROJECT_ROOT,
+    Settings,
+    get_model,
+    get_settings,
+    get_tool_scope,
+)
 from mas_deepr.data import (
     load_frames,
     load_health_bench,
@@ -48,6 +54,7 @@ from mas_deepr.evals import (
 from mas_deepr.logging_config import configure_logging
 from mas_deepr.memory import MEMORY_REGISTRY, get_memory_strategy
 from mas_deepr.prompts import has_compiled_prompt
+from mas_deepr.storage import RunSync
 from mas_deepr.telemetry import (
     TelemetryTracker,
     TrajectoryLogger,
@@ -379,6 +386,13 @@ async def main() -> None:
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
+        "--r2-sync",
+        action="store_true",
+        help="When the run finishes, upload its output folder plus the W&B "
+        "run folder(s) it created to Cloudflare R2 (needs the r2 extra and "
+        "the R2 vars in .env). Failures only warn.",
+    )
+    parser.add_argument(
         "--no-wandb",
         action="store_true",
         help="Disable the optional W&B mirror even if WANDB_API_KEY is set",
@@ -403,6 +417,7 @@ async def main() -> None:
         )
 
     settings = get_settings()
+    r2 = RunSync(enabled=args.r2_sync, settings=settings, root=PROJECT_ROOT)
     models = args.models.split(",")
     benchmarks = args.benchmarks.split(",")
     benchmark_limits = _parse_benchmark_limits(args.benchmark_limit)
@@ -470,6 +485,8 @@ async def main() -> None:
         if tool_calls_path.exists():
             print(f"\nTool-call summary for {model_key} (expect $0 by default):")
             print(summarize_tool_calls(tool_calls_path).filter(this_run))
+
+    r2.finish([settings.runs_dir / "milestones" / args.milestone])
 
 
 if __name__ == "__main__":

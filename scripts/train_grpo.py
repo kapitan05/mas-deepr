@@ -58,11 +58,12 @@ from typing import Any
 import art
 from art.serverless.backend import ServerlessBackend
 
-from mas_deepr.config import get_model, get_settings
+from mas_deepr.config import PROJECT_ROOT, get_model, get_settings
 from mas_deepr.data import build_train_pool, load_dr_tulu_paper_rubrics
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.logging_config import configure_logging
 from mas_deepr.rl.rollout import run_rollout_group
+from mas_deepr.storage import RunSync
 from mas_deepr.telemetry import TelemetryTracker, WandbSink, wandb_enabled
 
 
@@ -153,11 +154,19 @@ async def main() -> None:
         "supported by the Browser's findings. Off by default.",
     )
     parser.add_argument("--hallucination-penalty-weight", type=float, default=0.15)
+    parser.add_argument(
+        "--r2-sync",
+        action="store_true",
+        help="When the run finishes, upload its output folder plus the W&B "
+        "run folder(s) it created to Cloudflare R2 (needs the r2 extra and "
+        "the R2 vars in .env). Failures only warn.",
+    )
     args = parser.parse_args()
 
     configure_logging()
     settings = get_settings()
     settings.ensure_dirs()
+    r2 = RunSync(enabled=args.r2_sync, settings=settings, root=PROJECT_ROOT)
 
     if not wandb_enabled():
         raise SystemExit(
@@ -322,6 +331,8 @@ async def main() -> None:
         # ModelSpec.model_id for eval.
         uri = model.get_inference_name()
         print(f"Servable checkpoint (latest step): {uri}")
+
+    r2.finish([settings.runs_dir / "grpo"])
 
 
 if __name__ == "__main__":

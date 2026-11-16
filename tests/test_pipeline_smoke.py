@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 from agent_framework import Agent
 
+from mas_deepr.agents.parsing import LEAK_FALLBACK_FINDING
 from mas_deepr.agents.topology import ResearchPipeline, run_pipeline
 from mas_deepr.config.models import ModelSpec
 from mas_deepr.telemetry import TelemetryTracker, read_telemetry
@@ -155,3 +156,203 @@ async def test_run_pipeline_with_no_mcp_client_is_unaffected(tmp_path: Path) -> 
 
     result = await run_pipeline(pipeline, "q", question_id="q4")
     assert result.final_answer == "Answer"
+
+
+# --- Leaked tool-call text (C1) ---------------------------------------------
+
+_LEAK = '<tool_call>\n{"name": "fetch_page", "arguments": {"url": "https://x.org"}}\n</tool_call>'
+
+
+class _FakeResultContent:
+    """Duck-typed MAF ``function_result`` content (what a tool returned)."""
+
+    def __init__(self, result: str) -> None:
+        self.type = "function_result"
+        self.result = result
+
+
+class _FakeToolMessage:
+    def __init__(self, result: str) -> None:
+        self.role = "tool"
+        self.text = ""
+        self.contents = [_FakeResultContent(result)]
+
+
+class _FakeResponseWithMessages(_FakeResponse):
+    def __init__(self, text: str, messages: list[object]) -> None:
+        super().__init__(text)
+        self.messages = messages
+
+
+class _ScriptedAgent:
+    """Like _FakeAgent, but each scripted reply can carry messages."""
+
+    def __init__(self, responses: list[_FakeResponse]) -> None:
+        self._responses = iter(responses)
+        self.calls: list[str] = []
+
+    async def run(self, prompt: str, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(prompt)
+        return next(self._responses)
+
+
+def _leak_pipeline(
+    tmp_path: Path,
+    *,
+    browser_replies: list[_FakeResponse],
+    recovery_replies: list[str] | None,
+    synth_reply: str = "Final answer",
+) -> tuple[ResearchPipeline, _ScriptedAgent, _FakeAgent | None, _FakeAgent]:
+    manager = _FakeAgent(["1. What is X?"])
+    browser = _ScriptedAgent(browser_replies)
+    recovery = _FakeAgent(recovery_replies) if recovery_replies is not None else None
+    synthesizer = _FakeAgent([synth_reply])
+    tracker = TelemetryTracker(tmp_path / "telemetry.jsonl", run_id="c1", phase="dev")
+    pipeline = ResearchPipeline(
+        manager=cast(Agent, manager),
+        browser=cast(Agent, browser),
+        synthesizer=cast(Agent, synthesizer),
+        spec=_SPEC,
+        tracker=tracker,
+        browser_recovery=cast(Agent, recovery) if recovery is not None else None,
+    )
+    return pipeline, browser, recovery, synthesizer
+
+
+@pytest.mark.asyncio
+async def test_leaked_finding_triggers_one_tool_free_retry(tmp_path: Path) -> None:
+    leaked = _FakeResponseWithMessages(
+        f"Let me check one more page.\n{_LEAK}",
+        [_FakeToolMessage("X was founded in 1889 (source: https://x.org).")],
+    )
+    pipeline, _browser, recovery, synthesizer = _leak_pipeline(
+        tmp_path,
+        browser_replies=[leaked],
+        recovery_replies=["X was founded in 1889. Source: https://x.org"],
+    )
+
+    result = await run_pipeline(pipeline, "original question", question_id="c1a")
+
+    assert recovery is not None
+    assert len(recovery.calls) == 1
+    # The retry prompt carries the sub-question and the evidence already
+    # gathered (each agent.run() is a fresh conversation).
+    assert "What is X?" in recovery.calls[0]
+    assert "founded in 1889" in recovery.calls[0]
+    assert "no tool calls left" in recovery.calls[0]
+
+    assert result.findings == ["X was founded in 1889. Source: https://x.org"]
+    assert "<tool_call" not in synthesizer.calls[0]
+    assert result.leaked_tool_calls == 1
+    assert result.leaks_recovered == 1
+
+    telemetry = read_telemetry(tmp_path / "telemetry.jsonl")
+    assert "browser_recovery" in telemetry["role"].to_list()
+
+
+@pytest.mark.asyncio
+async def test_clean_finding_triggers_no_retry(tmp_path: Path) -> None:
+    pipeline, _browser, recovery, _synth = _leak_pipeline(
+        tmp_path,
+        browser_replies=[_FakeResponse("X was founded in 1889.")],
+        recovery_replies=[],
+    )
+
+    result = await run_pipeline(pipeline, "original question", question_id="c1b")
+
+    assert recovery is not None
+    assert recovery.calls == []
+    assert result.findings == ["X was founded in 1889."]
+    assert result.leaked_tool_calls == 0
+    assert result.leaks_recovered == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_that_leaks_again_falls_back_to_marker(tmp_path: Path) -> None:
+    pipeline, _browser, recovery, synthesizer = _leak_pipeline(
+        tmp_path,
+        browser_replies=[_FakeResponse(_LEAK)],
+        recovery_replies=[_LEAK],
+    )
+
+    result = await run_pipeline(pipeline, "original question", question_id="c1c")
+
+    assert recovery is not None
+    assert len(recovery.calls) == 1  # exactly one retry, never a loop
+    assert result.findings == [LEAK_FALLBACK_FINDING]
+    assert LEAK_FALLBACK_FINDING in synthesizer.calls[0]
+    assert "<tool_call" not in synthesizer.calls[0]
+    assert result.leaked_tool_calls == 1
+    assert result.leaks_recovered == 0
+
+
+@pytest.mark.asyncio
+async def test_leak_without_recovery_agent_keeps_cleaned_prose(
+    tmp_path: Path,
+) -> None:
+    pipeline, _browser, _recovery, _synth = _leak_pipeline(
+        tmp_path,
+        browser_replies=[_FakeResponse(f"X was founded in 1889.\n{_LEAK}")],
+        recovery_replies=None,
+    )
+
+    result = await run_pipeline(pipeline, "original question", question_id="c1d")
+
+    assert result.findings == ["X was founded in 1889."]
+    assert result.leaked_tool_calls == 1
+
+
+class _FailingAgent:
+    async def run(self, prompt: str, **kwargs: Any) -> _FakeResponse:
+        raise RuntimeError("endpoint down")
+
+
+@pytest.mark.asyncio
+async def test_failed_retry_does_not_fail_the_question(tmp_path: Path) -> None:
+    pipeline, _browser, _recovery, _synth = _leak_pipeline(
+        tmp_path,
+        browser_replies=[_FakeResponse(f"Partial answer.\n{_LEAK}")],
+        recovery_replies=None,
+    )
+    pipeline.browser_recovery = cast(Agent, _FailingAgent())
+
+    result = await run_pipeline(pipeline, "original question", question_id="c1e")
+
+    assert result.findings == ["Partial answer."]
+    assert result.final_answer == "Final answer"
+
+
+@pytest.mark.asyncio
+async def test_leaked_final_answer_is_cleaned(tmp_path: Path) -> None:
+    pipeline, _browser, _recovery, _synth = _leak_pipeline(
+        tmp_path,
+        browser_replies=[_FakeResponse("X was founded in 1889.")],
+        recovery_replies=[],
+        synth_reply=f"X was founded in 1889.\nFINAL ANSWER: 1889\n{_LEAK}",
+    )
+
+    result = await run_pipeline(pipeline, "original question", question_id="c1f")
+
+    assert result.final_answer == "X was founded in 1889.\nFINAL ANSWER: 1889"
+    assert result.leaked_tool_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_role_turns_keep_original_leaked_text(tmp_path: Path) -> None:
+    """GRPO trains on role_turns: the policy's real (leaked) output must be
+    preserved there, with the retry as an extra turn -- only the findings
+    passed downstream are cleaned."""
+    pipeline, _browser, _recovery, _synth = _leak_pipeline(
+        tmp_path,
+        browser_replies=[_FakeResponse(_LEAK)],
+        recovery_replies=["X was founded in 1889."],
+    )
+
+    result = await run_pipeline(
+        pipeline, "original question", question_id="c1g", capture_logprobs=True
+    )
+
+    roles = [role for role, _turn in result.role_turns]
+    assert roles == ["manager", "browser", "browser_recovery", "synthesizer"]
+    browser_turn = result.role_turns[1][1]
+    assert browser_turn.text == _LEAK

@@ -26,6 +26,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Cloudflare R2 archive (S3 protocol) for scripts/sync_to_r2.py and the
+# --r2-sync flag -- optional so the core install stays unchanged.
+r2 = [
+    "boto3>=1.40.0",
+]
 rl-art = [
     "openpipe-art>=0.5.20",
     "peft>=0.21.1",
@@ -88,6 +93,11 @@ ignore_missing_imports = true
 # expressions they guard become untyped Any instead of art's real types).
 [[tool.mypy.overrides]]
 module = ["art.*", "torch.*", "transformers.*", "trl.*", "peft.*"]
+ignore_missing_imports = true
+
+# r2 extra (boto3) -- optional like rl-art; storage/r2.py imports it lazily.
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
 ignore_missing_imports = true
 
 # tests/test_rollout.py's `# type: ignore[...]` comments suppress real

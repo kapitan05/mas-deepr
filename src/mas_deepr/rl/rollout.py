@@ -39,7 +39,7 @@ from mas_deepr.agents.topology import (
     choice_from_message,
     run_pipeline,
 )
-from mas_deepr.config import ModelSpec, Settings, get_tool_scope
+from mas_deepr.config import ModelSpec, Settings, behaviour_for_model_id, get_tool_scope
 from mas_deepr.data.schema import Question
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.rl.rubric_reward import (
@@ -228,6 +228,23 @@ def build_trajectory_from_result(
             metadata=metadata,
         )
 
+    if result.context_stats is not None:
+        # B1 guard counters -> W&B alongside the reward/* metrics.
+        base_metrics.update(
+            {
+                f"context/{k}": float(v)
+                for k, v in result.context_stats.as_dict().items()
+            }
+        )
+
+    if result.tool_guard_stats is not None:
+        base_metrics.update(
+            {
+                f"tools/{k}": float(v)
+                for k, v in result.tool_guard_stats.as_dict().items()
+            }
+        )
+
     messages_and_choices: list[_MessageOrChoice] = []
     for _role, turn in result.role_turns:
         messages_and_choices.extend(_entries_for_turn(turn))
@@ -304,7 +321,20 @@ async def rollout_fn(
         slm_model=model.get_inference_name(step=step),
         mcp_enabled_tools=get_tool_scope(tool_scope),
     )
-    spec = ModelSpec(key=model.name, model_id=settings.slm_model, family="qwen3")
+    # Endpoint/name come from ART; *behaviour* (tool-call quirks, code-exec
+    # support, context window) from the registry entry for the same base
+    # model -- e.g. Llama 3.1 8B needs single_tool_call_per_turn and
+    # supports_code_exec=False here exactly as in evals, or rollouts 400 on
+    # multi-call turns / garble run_python. Unknown base models keep the
+    # previous defaults (family="qwen3", everything else ModelSpec's own).
+    spec = ModelSpec(
+        **{
+            "family": "qwen3",
+            **behaviour_for_model_id(str(getattr(model, "base_model", "") or "")),
+            "key": model.name,
+            "model_id": settings.slm_model,
+        }
+    )
     pipeline = build_pipeline(
         spec=spec,
         settings=settings,
@@ -357,7 +387,7 @@ async def rollout_fn(
             base_score=reward,
             num_role_turns=len(result.role_turns),
             is_hallucinating=is_hallucinating,
-            turn_penalty_weight=turn_penalty_weight,
+            turn_penalty_weight=turn_penalty_weight if penalize_turns else 0.0,
             hallucination_penalty_weight=hallucination_penalty_weight,
         )
 
