@@ -38,14 +38,15 @@ SUDO=""
 if [[ $EUID -ne 0 ]]; then SUDO="sudo"; fi
 
 # --- 1. system packages ------------------------------------------------------
+# g++ (not just gcc): vLLM compiles FlashInfer kernels on first start.
 say "System packages"
 if ! command -v git >/dev/null || ! command -v tmux >/dev/null \
-   || ! command -v curl >/dev/null || ! command -v gcc >/dev/null; then
+   || ! command -v curl >/dev/null || ! command -v g++ >/dev/null; then
   $SUDO apt-get update -y
   DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y \
     git tmux curl ca-certificates build-essential
 else
-  echo "git, tmux, curl, gcc already installed"
+  echo "git, tmux, curl, g++ already installed"
 fi
 
 # --- 2. uv -------------------------------------------------------------------

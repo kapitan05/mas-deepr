@@ -78,7 +78,7 @@ def test_plan_order_dependencies_and_dspy() -> None:
     assert compile_argv[compile_argv.index("--auto") + 1] == "medium"
     assert "--prefer-compiled" in by_id["dspy:eval"].argv
     assert ".art/mas-deepr/models/qwen4b-s1-baseline" in by_id["s1-baseline:sync"].argv
-    assert by_id["final:sync"].always
+    assert all(j.always == j.job_id.endswith(":sync") for j in jobs)
 
 
 def test_smoke_plan_is_separate_and_tiny() -> None:
@@ -134,8 +134,23 @@ def test_rerun_skips_done_jobs_but_always_reuploads(tmp_path: Path) -> None:
     _run(tmp_path, cfg, {})
     outcomes, calls = _run(tmp_path, cfg, {})
     assert outcomes["s1-baseline:train"] == "already done"
+    assert outcomes["s1-baseline:sync"] == "done"
     assert outcomes["final:sync"] == "done"
-    assert len(calls) == 1 and "sync_to_r2.py" in calls[0][1]
+    assert len(calls) == 2 and all("sync_to_r2.py" in c[1] for c in calls)
+
+
+def test_retried_training_is_uploaded_again(tmp_path: Path) -> None:
+    """The smoke-run case: training failed, its upload ran anyway; rerunning
+    with the failure cleared must upload the retry's results again."""
+    cfg = rq.QueueConfig(python="py", stages=["s1-baseline"])
+    _run(tmp_path, cfg, {"s1-baseline:train": 1})
+    state = rq.QueueState(tmp_path / "state.json")
+    del state.status["s1-baseline:train"]  # what --retry-failed does
+    state.set("s1-baseline:sync", "done")
+    outcomes, calls = _run(tmp_path, cfg, {})
+    assert outcomes["s1-baseline:train"] == "done"
+    assert outcomes["s1-baseline:sync"] == "done"
+    assert any(".art/p/models/qwen4b-s1-baseline" in c for call in calls for c in call)
 
 
 def test_interrupted_training_resumes_from_last_checkpoint(tmp_path: Path) -> None:
@@ -211,3 +226,13 @@ def test_eval_and_dspy_commands_parse_with_the_real_scripts(
                 monkeypatch.setattr(sys, "argv", job.argv[1:])
                 with pytest.raises(_Parsed):
                     module.main()
+
+
+def test_main_sets_gpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    for name in ("VLLM_USE_V2_MODEL_RUNNER", "ART_MEGATRON_CACHE_ROOT", "HF_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    assert rq.main(["--dry-run"]) == 0
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert os.environ["ART_MEGATRON_CACHE_ROOT"].endswith(os.path.join(".cache", "art"))

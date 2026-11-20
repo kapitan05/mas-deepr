@@ -221,7 +221,10 @@ def test_backend_train_result_is_logged_to_wandb() -> None:
     docstring says explicitly it does NOT log metrics on its own."""
     source = _SCRIPT_PATH.read_text()
     assert "train_result = await backend.train(" in source
-    assert "model.log(metrics=train_result.metrics, step=train_result.step)" in source
+    # The train result's metrics are logged -- together with the count of
+    # long calls the sequence cap left out (train/long_calls_dropped).
+    assert "step_metrics = dict(train_result.metrics)" in source
+    assert "model.log(metrics=step_metrics, step=train_result.step)" in source
 
 
 def test_never_give_up_flags_default_off() -> None:
@@ -276,6 +279,9 @@ def test_local_gpu_and_memory_options_are_wired_into_the_real_script() -> None:
     source = _SCRIPT_PATH.read_text()
     assert "add_local_gpu_args(parser)" in source
     assert "**local_model_kwargs(args)" in source
+    assert "add_local_train_args(parser)" in source
+    assert "**train_kwargs," in source
+    assert "train/long_calls_dropped" in source
     assert '"--memory"' in source
     assert "choices=sorted(MEMORY_REGISTRY)" in source
     assert "memory=args.memory" in source

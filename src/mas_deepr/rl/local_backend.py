@@ -24,9 +24,25 @@ ART's own defaults that matter here (openpipe-art 0.5.20-0.5.24,
   (``Settings.context_window_tokens``).
 - Tool calling is already on (vLLM ``enable_auto_tool_choice`` with the
   ``hermes`` parser, which is Qwen3's format).
+
+Training-step memory (``backend.train()``; found by the first real run,
+2026-11-20, which ran out of GPU memory in ART's log-probability pass):
+
+- ART packs the step's model calls into sequences as long as the longest
+  call (rounded up to 2,048). At 16K tokens the bf16 model plus the update
+  no longer fits 22 GB, so ``packed_sequence_length`` caps the sequence at
+  12,288 -- calls longer than that are left out of the update (ART warns;
+  ``train_grpo.py`` logs the count). In s1's first 15 steps the longest
+  call was ~15K tokens and the 99th percentile ~12.6K.
+- ``logprob_calculation_chunk_size`` 1024 -> 256: ART computes log-probs and
+  entropy over the 151,936-token vocabulary one chunk at a time, briefly
+  holding several ``chunk x vocab`` fp32 tensors (~0.6 GB each at 1024).
+  Smaller chunks only change memory and speed, not the computed values.
 """
 
 import argparse
+import re
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -37,6 +53,13 @@ DEFAULT_GPU_MEMORY_UTILIZATION = 0.8
 DEFAULT_LORA_RANK = 16  # same as rl/lora.py (cold-start SFT / DPO)
 DEFAULT_LORA_ALPHA = 32
 DEFAULT_KEEP_CHECKPOINT_EVERY = 25
+DEFAULT_LOGPROB_CHUNK_SIZE = 256
+DEFAULT_PACKED_SEQUENCE_LENGTH = 12_288
+# train_grpo.py prints a warning when a step leaves more than this share of
+# its rollouts partly out of the update because of the sequence cap.
+LONG_CALL_WARN_FRACTION = 0.05
+_ART_AUTO_SEQUENCE_MULTIPLE = 2_048  # ART's packed length when not capped
+_DROPPED_RE = re.compile(r"Dropping (\d+) tokenized results from (\d+) trajectories")
 
 
 def local_model_configs(
@@ -133,3 +156,62 @@ def local_model_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         lora_alpha=args.lora_alpha,
     )
     return {"_internal_config": internal, "lora_config": lora}
+
+
+def add_local_train_args(parser: argparse.ArgumentParser) -> None:
+    """Training-step memory flags for ``--backend local`` -- train_grpo.py
+    only (evaluation and DSPy don't run training steps)."""
+    group = parser.add_argument_group("local GPU training step (--backend local)")
+    group.add_argument(
+        "--packed-sequence-length",
+        type=int,
+        default=DEFAULT_PACKED_SEQUENCE_LENGTH,
+        help="Longest token sequence one training step processes; model calls "
+        "longer than this are left out of the update (counted in the "
+        "train/long_calls_dropped metric). 0 = ART's own choice (the step's "
+        "longest call, which can run out of memory on a 24 GB GPU).",
+    )
+    group.add_argument(
+        "--logprob-chunk-size",
+        type=int,
+        default=DEFAULT_LOGPROB_CHUNK_SIZE,
+        help="Tokens per chunk in ART's log-probability pass -- smaller uses "
+        "less GPU memory, same result.",
+    )
+
+
+def local_train_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """``backend.train()`` kwargs for ``args.backend == "local"``; empty for
+    any other backend. Raises ``ValueError`` on lengths ART would reject
+    mid-run (the packed length must be a multiple of the chunk size)."""
+    if args.backend != "local":
+        return {}
+    chunk = args.logprob_chunk_size
+    packed = args.packed_sequence_length
+    if chunk < 1:
+        raise ValueError("--logprob-chunk-size must be >= 1")
+    if packed < 0:
+        raise ValueError("--packed-sequence-length must be >= 0")
+    required_multiple = packed or _ART_AUTO_SEQUENCE_MULTIPLE
+    if required_multiple % chunk:
+        raise ValueError(
+            f"sequence length {required_multiple} must be a multiple of "
+            f"--logprob-chunk-size {chunk}"
+        )
+    return {
+        "logprob_calculation_chunk_size": chunk,
+        "packed_sequence_length": packed or None,
+    }
+
+
+def dropped_long_calls(messages: Iterable[str]) -> tuple[int, int]:
+    """``(model calls, rollouts)`` that ART left out of a training step for
+    being too long, summed over its "Dropping N tokenized results from M
+    trajectories ..." warnings (one per reason: model max length, packed
+    sequence length)."""
+    calls = rollouts = 0
+    for message in messages:
+        for match in _DROPPED_RE.finditer(message):
+            calls += int(match.group(1))
+            rollouts += int(match.group(2))
+    return calls, rollouts

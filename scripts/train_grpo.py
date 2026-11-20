@@ -54,6 +54,7 @@ import asyncio
 import itertools
 import os
 import random
+import warnings
 from typing import Any
 
 import art
@@ -66,8 +67,12 @@ from mas_deepr.logging_config import configure_logging
 from mas_deepr.memory import MEMORY_REGISTRY
 from mas_deepr.rl.local_backend import (
     DEFAULT_KEEP_CHECKPOINT_EVERY,
+    LONG_CALL_WARN_FRACTION,
     add_local_gpu_args,
+    add_local_train_args,
+    dropped_long_calls,
     local_model_kwargs,
+    local_train_kwargs,
     prune_checkpoints,
 )
 from mas_deepr.rl.rollout import run_rollout_group
@@ -217,6 +222,7 @@ async def main() -> None:
         "latest, delete the rest after each step.",
     )
     add_local_gpu_args(parser)
+    add_local_train_args(parser)
     parser.add_argument(
         "--evolving-rubrics",
         action=argparse.BooleanOptionalAction,
@@ -249,6 +255,10 @@ async def main() -> None:
         raise SystemExit("--keep-checkpoint-every must be >= 1")
     if args.skip_batches < 0:
         raise SystemExit("--skip-batches must be >= 0")
+    try:
+        train_kwargs = local_train_kwargs(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     configure_logging()
     settings = get_settings()
@@ -328,6 +338,8 @@ async def main() -> None:
                     "load_in_4bit": args.load_in_4bit,
                     "lora_rank": args.lora_rank,
                     "lora_alpha": args.lora_alpha,
+                    "packed_sequence_length": args.packed_sequence_length,
+                    "logprob_chunk_size": args.logprob_chunk_size,
                 }
                 if args.backend == "local"
                 else {}
@@ -416,10 +428,35 @@ async def main() -> None:
         # grad_norm/learning_rate under ART's own key names --
         # _UPSTREAM_TRAIN_METRIC_KEYS in art/serverless/backend.py maps
         # these onto "loss/*" W&B keys once actually logged.
-        train_result = await backend.train(
-            model, trajectory_groups, learning_rate=args.learning_rate
-        )
-        await model.log(metrics=train_result.metrics, step=train_result.step)
+        # ART reports model calls it leaves out of the update for being too
+        # long (--packed-sequence-length) only as warnings -- capture them
+        # to log the count, then print them as usual.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            train_result = await backend.train(
+                model,
+                trajectory_groups,
+                learning_rate=args.learning_rate,
+                **train_kwargs,
+            )
+        for w in caught:
+            print(f"{w.category.__name__}: {w.message}", flush=True)
+        step_metrics = dict(train_result.metrics)
+        if args.backend == "local":
+            n_rollouts = sum(len(tg.trajectories) for tg in trajectory_groups)
+            calls, rollouts = dropped_long_calls(str(w.message) for w in caught)
+            share = rollouts / max(n_rollouts, 1)
+            step_metrics["train/long_calls_dropped"] = calls
+            step_metrics["train/long_call_rollouts_frac"] = share
+            if share > LONG_CALL_WARN_FRACTION:
+                print(
+                    f"WARNING: step {step_idx + 1} left {calls} long model "
+                    f"call(s) from {rollouts}/{n_rollouts} rollouts ({share:.0%}) "
+                    f"out of the update (> {LONG_CALL_WARN_FRACTION:.0%}); "
+                    f"--packed-sequence-length={args.packed_sequence_length}",
+                    flush=True,
+                )
+        await model.log(metrics=step_metrics, step=train_result.step)
         step_num = await model.get_step()
         print(
             f"[step {step_idx + 1}/{args.num_steps}] trained on "

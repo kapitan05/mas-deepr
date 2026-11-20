@@ -86,7 +86,10 @@ class Job:
     argv: list[str]
     needs: list[str] = field(default_factory=list)  # job_ids that must be done
     stage: str | None = None  # training jobs: the stage whose LoRA they train
-    always: bool = False  # rerun on every invocation (the final upload)
+    # Rerun on every invocation: the uploads. sync_to_r2.py only sends what
+    # changed, and a done-marked upload from an earlier invocation (e.g. of a
+    # training attempt that failed) must not skip uploading the retry.
+    always: bool = False
 
 
 @dataclass
@@ -182,6 +185,7 @@ def build_plan(cfg: QueueConfig, *, project: str) -> list[Job]:
             Job(
                 f"{stage}:sync",
                 sync_argv(cfg, ["runs", "wandb", f".art/{project}/models/{name}"]),
+                always=True,
             )
         )
     if cfg.dspy and DSPY_STAGE in cfg.stages:
@@ -208,6 +212,7 @@ def build_plan(cfg: QueueConfig, *, project: str) -> list[Job]:
             Job(
                 "dspy:sync",
                 sync_argv(cfg, ["runs", "wandb", "src/mas_deepr/prompts/templates"]),
+                always=True,
             )
         )
     jobs.append(
@@ -415,6 +420,12 @@ def main(argv: list[str] | None = None) -> int:
 
     os.environ.setdefault("ART_MEGATRON_CACHE_ROOT", str(ART_CACHE_DIR))
     os.environ.setdefault("HF_HOME", str(ART_CACHE_DIR / "huggingface"))
+    # vLLM 0.25 runs dense models (Qwen3-4B) on its new V2 model runner by
+    # default; ART 0.5.20-0.5.24's policy-span patch crashes in that runner's
+    # start-up profiling run (KeyError on a dummy request id). The V1 runner
+    # never goes through the patched path there -- and ART itself forces V1
+    # in one of its own code paths.
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
     from mas_deepr.config import get_settings
 

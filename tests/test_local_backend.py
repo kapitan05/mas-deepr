@@ -118,3 +118,41 @@ def test_local_model_kwargs_only_for_local_backend() -> None:
     assert set(kwargs) == {"_internal_config", "lora_config"}
     assert kwargs["_internal_config"]["init_args"]["load_in_4bit"] is True
     assert kwargs["lora_config"]["rank"] == 8
+
+
+def test_local_train_kwargs_defaults_and_validation() -> None:
+    from mas_deepr.rl.local_backend import add_local_train_args, local_train_kwargs
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", default="serverless")
+    add_local_train_args(parser)
+    assert local_train_kwargs(parser.parse_args([])) == {}
+    assert local_train_kwargs(parser.parse_args(["--backend", "local"])) == {
+        "logprob_calculation_chunk_size": 256,
+        "packed_sequence_length": 12_288,
+    }
+    auto = parser.parse_args(["--backend", "local", "--packed-sequence-length", "0"])
+    assert local_train_kwargs(auto)["packed_sequence_length"] is None
+    for bad in (
+        ["--packed-sequence-length", "1000"],  # not a multiple of 256
+        ["--logprob-chunk-size", "0"],
+        ["--packed-sequence-length", "-1"],
+        ["--packed-sequence-length", "0", "--logprob-chunk-size", "3000"],
+    ):
+        with pytest.raises(ValueError):
+            local_train_kwargs(parser.parse_args(["--backend", "local", *bad]))
+
+
+def test_dropped_long_calls_parses_art_warnings() -> None:
+    from mas_deepr.rl.local_backend import dropped_long_calls
+
+    messages = [
+        "Dropping 3 tokenized results from 2 trajectories that do not fit "
+        "packed_sequence_length=12288 (max seen 15011). This affects training, "
+        "but your model may still learn.",
+        "Dropping 1 tokenized results from 1 trajectories longer than model "
+        "max_seq_length=32768 (max seen 33000).",
+        "some unrelated warning",
+    ]
+    assert dropped_long_calls(messages) == (4, 3)
+    assert dropped_long_calls([]) == (0, 0)
