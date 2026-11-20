@@ -238,14 +238,16 @@ def test_main_sets_gpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     assert os.environ["ART_MEGATRON_CACHE_ROOT"].endswith(os.path.join(".cache", "art"))
 
 
-def test_trainer_runs_4bit_and_every_local_job_matches() -> None:
-    """Training, evaluation and DSPy all pass --load-in-4bit, so each
-    checkpoint is served with the settings it was trained with."""
+def test_every_local_job_uses_the_same_model_flags() -> None:
+    """Training, evaluation and DSPy share LOCAL_MODEL_FLAGS (a checkpoint is
+    served with the settings it was trained with); bf16 = no 4-bit flag."""
     cfg = rq.QueueConfig(python="py")
-    assert "--load-in-4bit" in rq.train_argv(cfg, "s1-baseline", done_steps=0)
+    assert rq.LOCAL_MODEL_FLAGS == []
+    train = rq.train_argv(cfg, "s1-baseline", done_steps=0)
+    assert "--load-in-4bit" not in train
     for job in rq.build_plan(cfg, project="p"):
         if job.argv and ("eval_grpo" in job.argv[1] or "compile_dspy" in job.argv[1]):
-            assert "--load-in-4bit" in job.argv, job.job_id
+            assert "--load-in-4bit" not in job.argv, job.job_id
 
 
 def test_run_tag_gives_fresh_names_and_state() -> None:

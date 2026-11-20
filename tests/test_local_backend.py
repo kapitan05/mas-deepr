@@ -129,7 +129,7 @@ def test_local_train_kwargs_defaults_and_validation() -> None:
     assert local_train_kwargs(parser.parse_args([])) == {}
     assert local_train_kwargs(parser.parse_args(["--backend", "local"])) == {
         "logprob_calculation_chunk_size": 256,
-        "packed_sequence_length": 12_288,
+        "packed_sequence_length": 6_144,
     }
     auto = parser.parse_args(["--backend", "local", "--packed-sequence-length", "0"])
     assert local_train_kwargs(auto)["packed_sequence_length"] is None

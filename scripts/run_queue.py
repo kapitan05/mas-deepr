@@ -62,15 +62,13 @@ STAGES: list[tuple[str, list[str]]] = [
 ]
 DSPY_STAGE = "s4-rubrics"
 
-# The trainer (Unsloth) loads the frozen base model in 4-bit NF4 (QLoRA) --
-# ART's own default. In bf16 the 4B model plus a 12K-token training step
-# needs more than the L4's 22 GB (first real run, 2026-11-20: out of memory
-# at 20.3 GB in ART's log-prob pass, even with the sequence cap). Only the
-# trainer is affected: vLLM gets ART's engine_args, which set no
-# quantization, so rollouts and all evaluations run the bf16 base + LoRA.
-# Passed to evaluation and DSPy too, so a checkpoint is served with the
-# settings it was trained with.
-LOCAL_MODEL_FLAGS = ["--load-in-4bit"]
+# Model flags shared by training, evaluation and DSPy, so a checkpoint is
+# served with the settings it was trained with. Empty = bf16 trainer, the
+# configuration proven on the L4 with sequences up to 6,144 tokens (see
+# rl/local_backend.py). "--load-in-4bit" (QLoRA; vLLM stays bf16) did not
+# help at 12,288 -- training memory there is dominated by the sequence
+# length, not the weights.
+LOCAL_MODEL_FLAGS: list[str] = []
 
 COMMON_TRAIN_FLAGS = [
     "--base-model", BASE_MODEL,

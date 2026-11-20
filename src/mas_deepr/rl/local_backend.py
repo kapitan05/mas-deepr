@@ -25,15 +25,20 @@ ART's own defaults that matter here (openpipe-art 0.5.20-0.5.24,
 - Tool calling is already on (vLLM ``enable_auto_tool_choice`` with the
   ``hermes`` parser, which is Qwen3's format).
 
-Training-step memory (``backend.train()``; found by the first real run,
-2026-11-20, which ran out of GPU memory in ART's log-probability pass):
+Training-step memory (``backend.train()``; found on the first real runs,
+2026-11-20):
 
-- ART packs the step's model calls into sequences as long as the longest
-  call (rounded up to 2,048). At 16K tokens the bf16 model plus the update
-  no longer fits 22 GB, so ``packed_sequence_length`` caps the sequence at
-  12,288 -- calls longer than that are left out of the update (ART warns;
-  ``train_grpo.py`` logs the count). In s1's first 15 steps the longest
-  call was ~15K tokens and the 99th percentile ~12.6K.
+- ART packs the step's model calls into sequences. Without a set length it
+  picks the step's longest call rounded up to 2,048; with
+  ``packed_sequence_length`` *every* sequence of every step has exactly that
+  length, and longer calls are left out of the update (ART warns;
+  ``train_grpo.py`` logs the count as ``train/long_calls_dropped``).
+- Training memory grows much faster than the sequence length. s1's first
+  15 steps (bf16) used 2,048-6,144 tokens and fit; step 16 needed a longer
+  sequence and ran out of memory, and a fixed 12,288 ran out of memory on
+  the first step in bf16 *and* with a 4-bit base (20.3 GB in the trainer
+  either way). 6,144 is the largest length proven on the 22 GB L4. In
+  those 15 steps no single call was longer, so few calls are dropped.
 - ``logprob_calculation_chunk_size`` 1024 -> 256: ART computes log-probs and
   entropy over the 151,936-token vocabulary one chunk at a time, briefly
   holding several ``chunk x vocab`` fp32 tensors (~0.6 GB each at 1024).
@@ -54,7 +59,7 @@ DEFAULT_LORA_RANK = 16  # same as rl/lora.py (cold-start SFT / DPO)
 DEFAULT_LORA_ALPHA = 32
 DEFAULT_KEEP_CHECKPOINT_EVERY = 25
 DEFAULT_LOGPROB_CHUNK_SIZE = 256
-DEFAULT_PACKED_SEQUENCE_LENGTH = 12_288
+DEFAULT_PACKED_SEQUENCE_LENGTH = 6_144
 # train_grpo.py prints a warning when a step leaves more than this share of
 # its rollouts partly out of the update because of the sequence cap.
 LONG_CALL_WARN_FRACTION = 0.05
