@@ -7,6 +7,7 @@ test_rollout.py's module docstring). Run via ``uv run pytest tests/ -m art``.
 """
 
 import argparse
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -269,3 +270,47 @@ def test_evolving_rubrics_flags_are_wired_into_the_real_script() -> None:
     assert "evolving_rubrics_max=args.evolving_rubrics_max" in source
     assert "evolving_rubrics_log=evolving_rubrics_log" in source
     assert '"evolving_rubrics": args.evolving_rubrics' in source
+
+
+def test_local_gpu_and_memory_options_are_wired_into_the_real_script() -> None:
+    source = _SCRIPT_PATH.read_text()
+    assert "add_local_gpu_args(parser)" in source
+    assert "**local_model_kwargs(args)" in source
+    assert '"--memory"' in source
+    assert "choices=sorted(MEMORY_REGISTRY)" in source
+    assert "memory=args.memory" in source
+    assert '"--keep-checkpoint-every"' in source
+    assert 'if args.backend in ("local", "tinker"):' in source
+    assert "await prune_checkpoints(" in source
+
+
+def test_queue_training_commands_parse_with_the_real_script(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every train command scripts/run_queue.py generates (fresh and resumed,
+    all stages, normal and smoke) gets through train_grpo.py's real argument
+    parsing and validation -- stopped right after, at configure_logging()."""
+    rq_spec = importlib.util.spec_from_file_location(
+        "run_queue_cli_t", _SCRIPT_PATH.parent / "run_queue.py"
+    )
+    assert rq_spec is not None and rq_spec.loader is not None
+    rq = importlib.util.module_from_spec(rq_spec)
+    sys.modules["run_queue_cli_t"] = rq
+    rq_spec.loader.exec_module(rq)
+
+    class _Parsed(Exception):
+        pass
+
+    def stop(*args: object, **kwargs: object) -> None:
+        raise _Parsed
+
+    module = _load_train_grpo()
+    monkeypatch.setattr(module, "configure_logging", stop)
+    for smoke in (False, True):
+        cfg = rq.QueueConfig(python="py", smoke=smoke)
+        for stage, _ in rq.STAGES:
+            for done in (0, 1):
+                argv = rq.train_argv(cfg, stage, done_steps=done)
+                monkeypatch.setattr(sys, "argv", argv[1:])
+                with pytest.raises(_Parsed):
+                    asyncio.run(module.main())  # type: ignore[attr-defined]

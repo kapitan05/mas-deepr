@@ -283,3 +283,131 @@ class RunSync:
         for key, err in report.failed:
             print(f"  failed: {key}: {err}")
         return report
+
+
+class S3DownloadClient(Protocol):
+    """The boto3 S3 client methods ``download_paths`` uses."""
+
+    def list_objects_v2(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]: ...
+
+    def download_file(self, Bucket: str, Key: str, Filename: str) -> None: ...
+
+
+@dataclass
+class DownloadReport:
+    downloaded: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list)
+    dry_run: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+    def summary(self) -> str:
+        verb = "would download" if self.dry_run else "downloaded"
+        return (
+            f"R2 pull: {verb} {len(self.downloaded)}, unchanged "
+            f"{len(self.skipped)}, kept local {len(self.conflicts)}, "
+            f"failed {len(self.failed)}"
+        )
+
+
+def _list_keys(client: S3DownloadClient, bucket: str, prefix: str) -> list[str]:
+    keys: list[str] = []
+    token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = client.list_objects_v2(**kwargs)
+        keys.extend(obj["Key"] for obj in page.get("Contents", []))
+        if not page.get("IsTruncated"):
+            return keys
+        token = page.get("NextContinuationToken")
+
+
+def download_paths(
+    client: S3DownloadClient,
+    bucket: str,
+    paths: Sequence[str],
+    *,
+    root: Path,
+    prefix: str = DEFAULT_PREFIX,
+    dry_run: bool = False,
+    overwrite: bool = False,
+) -> DownloadReport:
+    """Download everything under ``paths`` (project-relative, e.g.
+    ``"runs"``; ``""`` = the whole archive) from R2 into ``root`` -- the
+    reverse of ``sync_paths``, same key layout.
+
+    Never deletes anything. A local file whose size and SHA-256 already
+    match the object's stored hash is skipped; a local file that *differs*
+    is kept and reported as a conflict unless ``overwrite`` is set. Each
+    download goes to a temporary file first and is checked against the
+    stored hash before it replaces anything.
+    """
+    report = DownloadReport(dry_run=dry_run)
+    base = prefix.strip("/")
+    root = root.resolve()
+    for rel in paths:
+        rel = rel.strip("/").replace("\\", "/")
+        search = "/".join(p for p in (base, rel) if p)
+        for key in _list_keys(client, bucket, search + "/" if search else ""):
+            try:
+                local_rel = key[len(base) + 1 :] if base else key
+                local = (root / local_rel).resolve()
+                if root not in local.parents:
+                    raise ValueError("object key escapes the project folder")
+                head = client.head_object(Bucket=bucket, Key=key)
+                size = int(head.get("ContentLength", -1))
+                digest = (head.get("Metadata") or {}).get(_HASH_META_KEY)
+                if local.exists():
+                    if local.stat().st_size == size and digest == _sha256(local):
+                        report.skipped.append(key)
+                        continue
+                    if not overwrite:
+                        report.conflicts.append(key)
+                        continue
+                if dry_run:
+                    report.downloaded.append(key)
+                    continue
+                local.parent.mkdir(parents=True, exist_ok=True)
+                tmp = local.with_name(local.name + ".r2-partial")
+                client.download_file(bucket, key, str(tmp))
+                if digest is not None and _sha256(tmp) != digest:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError("verification failed: hash mismatch")
+                tmp.replace(local)
+                report.downloaded.append(key)
+            except Exception as e:
+                logger.warning("R2 download failed for %s: %s", key, e)
+                report.failed.append((key, f"{type(e).__name__}: {e}"))
+    return report
+
+
+def download_from_r2(
+    paths: Sequence[str],
+    *,
+    settings: "Settings",
+    root: Path,
+    prefix: str = DEFAULT_PREFIX,
+    dry_run: bool = False,
+    overwrite: bool = False,
+    client: S3DownloadClient | None = None,
+) -> DownloadReport:
+    """Config from ``settings`` + a real client (unless one is given)."""
+    config = R2Config.from_settings(settings)
+    real: Any = client or make_client(config)
+    return download_paths(
+        real,
+        config.bucket,
+        paths,
+        root=root,
+        prefix=prefix,
+        dry_run=dry_run,
+        overwrite=overwrite,
+    )

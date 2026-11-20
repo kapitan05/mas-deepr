@@ -47,6 +47,7 @@ from mas_deepr.agents.topology import (
 from mas_deepr.config import ModelSpec, Settings, behaviour_for_model_id, get_tool_scope
 from mas_deepr.data.schema import Question
 from mas_deepr.evals.judge import JudgeClient
+from mas_deepr.memory import get_memory_strategy
 from mas_deepr.rl.rubric_reward import (
     apply_reward_shaping,
     combine_with_evolving_rubrics,
@@ -277,6 +278,7 @@ async def rollout_fn(
     turn_penalty_weight: float = 0.03,
     penalize_hallucination: bool = False,
     hallucination_penalty_weight: float = 0.15,
+    memory: str = "stateless",
 ) -> art.Trajectory:
     """One ART rollout: run the MAS pipeline against ``model``'s inference
     endpoint, grade it, return a scored ``Trajectory``.
@@ -317,6 +319,7 @@ async def rollout_fn(
         tracker=tracker,
         tool_scope=tool_scope,
         prefer_compiled=prefer_compiled,
+        memory=memory,
     )
 
     if question.rubrics is not None:
@@ -375,10 +378,15 @@ async def _run_rollout_pipeline(
     tracker: TelemetryTracker,
     tool_scope: str,
     prefer_compiled: bool,
+    memory: str = "stateless",
 ) -> PipelineResult:
     """Run the MAS pipeline once against ``model``'s current checkpoint --
     the ungraded half of a rollout, shared by ``rollout_fn`` and the
-    evolving-rubrics path in ``run_rollout_group``."""
+    evolving-rubrics path in ``run_rollout_group``.
+
+    ``memory`` is a ``memory/`` registry key (e.g. ``"folding"``), the same
+    strategies the eval scripts' ``--memory`` uses. ``"stateless"`` passes
+    no strategy at all, exactly as before this option existed."""
     # model.inference_model_name is UNVERSIONED (no :stepN suffix) --
     # confirmed live 2026-09-28 that ART's ServerlessBackend rejects it
     # outright for inference ("LoRA inference requires an explicit
@@ -423,6 +431,7 @@ async def _run_rollout_pipeline(
         pipeline,
         question.prompt,
         question_id=question.question_id,
+        memory=None if memory == "stateless" else get_memory_strategy(memory),
         capture_logprobs=True,
     )
 
@@ -448,6 +457,7 @@ async def _rubric_rollout(
     tool_scope: str,
     prefer_compiled: bool,
     penalize_hallucination: bool,
+    memory: str = "stateless",
 ) -> _RubricRollout:
     """Run + grade one rollout against the persistent rubrics only; the
     evolving rubrics are added once the whole group is in (see
@@ -459,6 +469,7 @@ async def _rubric_rollout(
         tracker=tracker,
         tool_scope=tool_scope,
         prefer_compiled=prefer_compiled,
+        memory=memory,
     )
     score, details = await judge.grade_research_rubrics(
         prompt=question.prompt,
@@ -633,6 +644,7 @@ async def run_rollout_group(
     evolving_rubrics: bool = False,
     evolving_rubrics_max: int = 5,
     evolving_rubrics_log: Path | None = None,
+    memory: str = "stateless",
 ) -> art.TrajectoryGroup:
     """Run ``group_size`` rollouts of the same question concurrently --
     one GRPO group.
@@ -691,6 +703,9 @@ async def run_rollout_group(
     shaping applied on top (DR Tulu's RLER, arXiv:2511.19399, scoped down
     -- see ``rl/rubric_reward.py``). Each group's generated and kept
     rubrics are appended to ``evolving_rubrics_log`` (JSONL) when given.
+
+    ``memory`` selects the memory/context strategy every rollout runs
+    under (``memory/`` registry key; default ``"stateless"``).
     """
     if ngu_max_extra_rounds < 0:
         raise ValueError("ngu_max_extra_rounds must be >= 0")
@@ -710,6 +725,7 @@ async def run_rollout_group(
                 turn_penalty_weight=turn_penalty_weight,
                 penalize_hallucination=penalize_hallucination,
                 hallucination_penalty_weight=hallucination_penalty_weight,
+                memory=memory,
             )
 
     async def _one_rubric_rollout() -> _RubricRollout:
@@ -722,6 +738,7 @@ async def run_rollout_group(
                 tool_scope=tool_scope,
                 prefer_compiled=prefer_compiled,
                 penalize_hallucination=penalize_hallucination,
+                memory=memory,
             )
 
     trajectories: list[Any]

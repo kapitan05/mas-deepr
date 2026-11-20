@@ -77,6 +77,19 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             input_price_per_mtok=0.03,
             output_price_per_mtok=0.09,
         ),
+        # GRPO base model for the self-hosted (LoRA on one 24 GB GPU) runs:
+        # the non-thinking July 2025 update of Qwen3-4B. Native context is
+        # 262k tokens, but it's served and trained at 32,768 (rl/
+        # local_backend.py) -- the token-budget guard's default window,
+        # so context_window_tokens stays unset. Prices as qwen3-4b above.
+        ModelSpec(
+            key="qwen3-4b-instruct-2507",
+            model_id="Qwen/Qwen3-4B-Instruct-2507",
+            family="qwen3",
+            params_b=4,
+            input_price_per_mtok=0.03,
+            output_price_per_mtok=0.09,
+        ),
         ModelSpec(
             key="qwen3-8b",
             model_id="Qwen/Qwen3-8B",

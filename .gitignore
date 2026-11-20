@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 .venv-tinker
+.venv-gpu/
+
+# GPU VM caches -- ART's vLLM runtime, model weights (scripts/run_queue.py)
+/.cache
 
 /docs
 /papers

@@ -63,6 +63,13 @@ from mas_deepr.config import PROJECT_ROOT, get_model, get_settings
 from mas_deepr.data import build_train_pool, load_dr_tulu_paper_rubrics
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.logging_config import configure_logging
+from mas_deepr.memory import MEMORY_REGISTRY
+from mas_deepr.rl.local_backend import (
+    DEFAULT_KEEP_CHECKPOINT_EVERY,
+    add_local_gpu_args,
+    local_model_kwargs,
+    prune_checkpoints,
+)
 from mas_deepr.rl.rollout import run_rollout_group
 from mas_deepr.storage import RunSync
 from mas_deepr.telemetry import TelemetryTracker, WandbSink, wandb_enabled
@@ -131,6 +138,15 @@ async def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0, help="Batch shuffle seed.")
     parser.add_argument(
+        "--skip-batches",
+        type=int,
+        default=0,
+        help="Skip this many batches of the shuffled question order before "
+        "training -- for resuming an interrupted run (scripts/run_queue.py "
+        "passes the number of steps already trained), so a resumed run "
+        "continues with new questions instead of repeating the first ones.",
+    )
+    parser.add_argument(
         "--max-exceptions",
         type=float,
         default=20,
@@ -186,6 +202,22 @@ async def main() -> None:
         "3x --group-size rollouts per question).",
     )
     parser.add_argument(
+        "--memory",
+        choices=sorted(MEMORY_REGISTRY),
+        default="stateless",
+        help="Memory/context strategy every rollout runs under (memory/), "
+        "e.g. 'folding' -- the same strategies as run_milestone_eval.py "
+        "--memory. Evaluate the trained checkpoint with the same value.",
+    )
+    parser.add_argument(
+        "--keep-checkpoint-every",
+        type=int,
+        default=DEFAULT_KEEP_CHECKPOINT_EVERY,
+        help="local/tinker backends: keep every N-th checkpoint plus the "
+        "latest, delete the rest after each step.",
+    )
+    add_local_gpu_args(parser)
+    parser.add_argument(
         "--evolving-rubrics",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -213,6 +245,10 @@ async def main() -> None:
         raise SystemExit("--ngu-max-extra-rounds must be >= 0")
     if args.evolving_rubrics_max < 1:
         raise SystemExit("--evolving-rubrics-max must be >= 1")
+    if args.keep_checkpoint_every < 1:
+        raise SystemExit("--keep-checkpoint-every must be >= 1")
+    if args.skip_batches < 0:
+        raise SystemExit("--skip-batches must be >= 0")
 
     configure_logging()
     settings = get_settings()
@@ -235,6 +271,7 @@ async def main() -> None:
         run_name=args.model_name,
         project=settings.wandb_project,
         base_model=args.base_model,
+        **local_model_kwargs(args),
     )
     verifiable_pool = build_train_pool(
         settings, musique_limit=args.musique_limit, hotpot_limit=args.hotpot_limit
@@ -282,6 +319,19 @@ async def main() -> None:
             "ngu_max_extra_rounds": args.ngu_max_extra_rounds,
             "evolving_rubrics": args.evolving_rubrics,
             "evolving_rubrics_max": args.evolving_rubrics_max,
+            "keep_checkpoint_every": args.keep_checkpoint_every,
+            "memory": args.memory,
+            **(
+                {
+                    "max_seq_length": args.max_seq_length,
+                    "gpu_memory_utilization": args.gpu_memory_utilization,
+                    "load_in_4bit": args.load_in_4bit,
+                    "lora_rank": args.lora_rank,
+                    "lora_alpha": args.lora_alpha,
+                }
+                if args.backend == "local"
+                else {}
+            ),
         }
     )
     backend = _make_backend(args.backend)
@@ -305,6 +355,10 @@ async def main() -> None:
         else None
     )
     pool_cycle = itertools.cycle(questions)
+    # Resume support: consume the batches an interrupted run already trained
+    # on (same seed -> same shuffled order).
+    for _ in itertools.islice(pool_cycle, args.skip_batches * batch_size):
+        pass
     all_rows: list[list[Any]] = []
 
     for step_idx in range(args.num_steps):
@@ -328,6 +382,7 @@ async def main() -> None:
                 evolving_rubrics=args.evolving_rubrics,
                 evolving_rubrics_max=args.evolving_rubrics_max,
                 evolving_rubrics_log=evolving_rubrics_log,
+                memory=args.memory,
             )
             for q in batch
         ]
@@ -371,11 +426,14 @@ async def main() -> None:
             f"{len(trajectory_groups)} question groups -> checkpoint step "
             f"{step_num} ({args.backend} backend)."
         )
-        if args.backend == "tinker":
-            # Tinker's free storage tier stops training at 100 checkpoints
-            # and ART saves one per step; keep only the latest (and best,
-            # if a val metric is logged).
-            await model.delete_checkpoints()
+        if args.backend in ("local", "tinker"):
+            # ART saves a checkpoint every step -- on the VM's disk (local)
+            # or in Tinker's storage, whose free tier stops training at 100
+            # checkpoints. Keep every --keep-checkpoint-every-th step plus
+            # the latest, for evaluation and the thesis's learning curves.
+            await prune_checkpoints(
+                model, backend, keep_every=args.keep_checkpoint_every
+            )
 
     with WandbSink(
         project=settings.wandb_project,

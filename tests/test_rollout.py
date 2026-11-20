@@ -1098,3 +1098,44 @@ async def test_evolving_rubrics_flag_ignored_for_exact_match_questions(
     )
     assert calls[0] == 4
     assert len(group.trajectories) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memory", ["stateless", "folding"])
+async def test_rollout_fn_passes_memory_strategy_to_pipeline(
+    monkeypatch: pytest.MonkeyPatch, memory: str
+) -> None:
+    """--memory reaches run_pipeline: no strategy at all for "stateless"
+    (exactly the pre-option behaviour), the registry strategy otherwise."""
+    from mas_deepr.data.schema import Question
+    from mas_deepr.memory import get_memory_strategy
+    from mas_deepr.rl import rollout as rollout_mod
+
+    captured: dict[str, object] = {}
+
+    async def capturing_run_pipeline(
+        pipeline: object, prompt: str, **kwargs: object
+    ) -> object:
+        captured.update(kwargs)
+        return await _fake_run_pipeline(pipeline, prompt, **kwargs)
+
+    monkeypatch.setattr(
+        rollout_mod, "build_pipeline", lambda **kwargs: _RecordingPipeline()
+    )
+    monkeypatch.setattr(rollout_mod, "run_pipeline", capturing_run_pipeline)
+    question = Question(
+        question_id="q1", source="musique", split="train", prompt="p", answer="Paris"
+    )
+    judge, tracker = _fake_judge_and_tracker()
+    await rollout_mod.rollout_fn(
+        _make_model(monkeypatch),  # type: ignore[arg-type]
+        question,
+        judge=judge,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+        memory=memory,
+    )
+    if memory == "stateless":
+        assert captured["memory"] is None
+    else:
+        assert type(captured["memory"]) is type(get_memory_strategy(memory))
+    assert captured["capture_logprobs"] is True

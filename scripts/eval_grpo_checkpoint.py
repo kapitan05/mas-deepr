@@ -27,13 +27,18 @@ Usage:
 import argparse
 import asyncio
 import importlib.util
-import os
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
 
 import polars as pl
+
+from mas_deepr.rl.checkpoint_serving import (
+    checkpoint_spec,  # noqa: F401 -- re-exported for tests/test_eval_grpo_checkpoint.py
+    register_checkpoint_spec,
+    serve_checkpoint,
+)
 
 _SCRIPT_PATH = Path(__file__).resolve().with_name("run_milestone_eval.py")
 
@@ -47,35 +52,6 @@ def _load_run_milestone_eval() -> Any:
     sys.modules["run_milestone_eval_grpo_checkpoint"] = module
     spec.loader.exec_module(module)
     return module
-
-
-def checkpoint_spec(
-    *, model_key: str, inference_name: str, base_url: str | None, base_model: str
-) -> Any:
-    """ModelSpec for a trained checkpoint served by ART/W&B.
-
-    Endpoint, name and key come from ART; *behaviour* (tool-call quirks,
-    code-exec support, context window, size) from the registry entry for the
-    same base model -- e.g. a Llama 3.1 8B checkpoint keeps
-    single_tool_call_per_turn and supports_code_exec=False, exactly like its
-    pre-training eval (otherwise it 400s on multi-call turns and re-enables
-    the garbled run_python). Unknown base models keep the previous defaults
-    (family="qwen3", params_b=14). Same lookup as rl/rollout.py::rollout_fn.
-    """
-    from mas_deepr.config import ModelSpec, behaviour_for_model_id
-
-    return ModelSpec(
-        **{
-            "family": "qwen3",
-            "params_b": 14,
-            **behaviour_for_model_id(base_model),
-            "key": model_key,
-            "model_id": inference_name,
-            "self_hosted": False,
-            "api_base_url": base_url,
-            "api_key_env": "MAS_GRPO_CHECKPOINT_API_KEY",
-        }
-    )
 
 
 async def main() -> None:
@@ -120,6 +96,17 @@ async def main() -> None:
         "run folder(s) it created to Cloudflare R2 (needs the r2 extra and "
         "the R2 vars in .env). Failures only warn.",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("serverless", "local"),
+        default="serverless",
+        help="Where the checkpoint is served: W&B (serverless) or this "
+        "machine's GPU (local, for checkpoints trained with train_grpo.py "
+        "--backend local -- pass the same local-GPU flags used in training).",
+    )
+    from mas_deepr.rl.local_backend import add_local_gpu_args, local_model_kwargs
+
+    add_local_gpu_args(parser)
     args = parser.parse_args()
 
     from mas_deepr.config import PROJECT_ROOT, get_settings
@@ -127,22 +114,16 @@ async def main() -> None:
 
     r2 = RunSync(enabled=args.r2_sync, settings=get_settings(), root=PROJECT_ROOT)
 
-    import art
-    from art.serverless.backend import ServerlessBackend
-
-    model: art.TrainableModel = art.TrainableModel(
-        name=args.model_name,
-        # Same convention as train_grpo.py -- required as of openpipe-art
-        # 0.5.20, see that file's comment on the same kwarg.
-        run_name=args.model_name,
+    served = await serve_checkpoint(
+        model_name=args.model_name,
         project=args.project,
         base_model=args.base_model,
+        backend_kind=args.backend,
+        model_kwargs=local_model_kwargs(args),
+        step=args.step,
     )
-    backend = ServerlessBackend()
-    await model.register(backend)
-    step = args.step if args.step is not None else await model.get_step()
-    inference_name = model.get_inference_name(step=step)
-    print(f"Evaluating checkpoint step={step}: {inference_name}")
+    step = served.step
+    print(f"Evaluating checkpoint step={step}: {served.inference_name}")
     if step == 0:
         print(
             "WARNING: step=0 is the untrained base model (no training has "
@@ -150,23 +131,13 @@ async def main() -> None:
             "--step explicitly, or train first?"
         )
 
-    if model.inference_api_key:
-        os.environ["MAS_GRPO_CHECKPOINT_API_KEY"] = model.inference_api_key
-
     rme = _load_run_milestone_eval()
-
-    from mas_deepr.config.models import MODEL_REGISTRY
 
     # Memory suffix goes before "-step<N>", not after, so the result still
     # matches watch_grpo_progress.py's "<arm>-step<N>" parsing convention.
     memory_suffix = f"-{args.memory}" if args.memory != "stateless" else ""
     model_key = args.label or f"{args.model_name}{memory_suffix}-step{step}"
-    MODEL_REGISTRY[model_key] = checkpoint_spec(
-        model_key=model_key,
-        inference_name=inference_name,
-        base_url=model.inference_base_url,
-        base_model=args.base_model,
-    )
+    register_checkpoint_spec(served, model_key=model_key, base_model=args.base_model)
 
     milestone = "post-grpo"
     benchmark_limits = rme._parse_benchmark_limits(args.benchmark_limit)

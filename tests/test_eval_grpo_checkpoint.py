@@ -46,3 +46,24 @@ def test_unknown_base_model_keeps_previous_defaults() -> None:
 def test_script_offers_r2_sync() -> None:
     text = _SCRIPT.read_text(encoding="utf-8")
     assert '"--r2-sync"' in text and "r2.finish([out_dir])" in text
+
+
+def test_script_can_serve_checkpoints_locally() -> None:
+    source = _SCRIPT.read_text()
+    assert 'choices=("serverless", "local")' in source
+    assert "add_local_gpu_args(parser)" in source
+    assert "serve_checkpoint(" in source
+    assert "backend_kind=args.backend" in source
+    assert "model_kwargs=local_model_kwargs(args)" in source
+
+
+def test_qwen3_4b_2507_checkpoint_gets_registry_behaviour() -> None:
+    spec = _load().checkpoint_spec(
+        model_key="qwen4b-baseline-step100",
+        inference_name="qwen4b-baseline@100",
+        base_url="http://127.0.0.1:8000/v1",
+        base_model="Qwen/Qwen3-4B-Instruct-2507",
+    )
+    assert spec.params_b == 4
+    assert spec.supports_native_tools is True
+    assert spec.single_tool_call_per_turn is False
