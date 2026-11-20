@@ -61,6 +61,10 @@ def _build_parser(module: object) -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--hallucination-penalty-weight", type=float, default=0.15)
+    parser.add_argument(
+        "--never-give-up", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--ngu-max-extra-rounds", type=int, default=2)
     return parser
 
 
@@ -213,3 +217,33 @@ def test_backend_train_result_is_logged_to_wandb() -> None:
     source = _SCRIPT_PATH.read_text()
     assert "train_result = await backend.train(" in source
     assert "model.log(metrics=train_result.metrics, step=train_result.step)" in source
+
+
+def test_never_give_up_flags_default_off() -> None:
+    module = _load_train_grpo()
+    parser = _build_parser(module)
+    args = parser.parse_args(["--base-model", "b"])
+    assert args.never_give_up is False
+    assert args.ngu_max_extra_rounds == 2
+
+
+def test_never_give_up_flags_can_be_set() -> None:
+    module = _load_train_grpo()
+    parser = _build_parser(module)
+    args = parser.parse_args(
+        ["--base-model", "b", "--never-give-up", "--ngu-max-extra-rounds", "1"]
+    )
+    assert args.never_give_up is True
+    assert args.ngu_max_extra_rounds == 1
+
+
+def test_never_give_up_flags_are_wired_into_the_real_script() -> None:
+    """The parser above is a reconstruction -- guard that the real script
+    declares the flags, passes them to run_rollout_group and records them
+    in the W&B config."""
+    source = _SCRIPT_PATH.read_text()
+    assert '"--never-give-up"' in source
+    assert '"--ngu-max-extra-rounds"' in source
+    assert "never_give_up=args.never_give_up" in source
+    assert "ngu_max_extra_rounds=args.ngu_max_extra_rounds" in source
+    assert '"never_give_up": args.never_give_up' in source

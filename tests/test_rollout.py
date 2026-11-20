@@ -593,6 +593,149 @@ async def test_run_rollout_group_llm_semaphore_bounds_concurrency(
     assert max_in_flight == 2
 
 
+def _scripted_rollout_fn(
+    rewards: list[float],
+    *,
+    fail_on_call: int | None = None,
+    base_rewards: list[float] | None = None,
+) -> tuple[Any, list[int]]:
+    """A fake ``rollout_fn`` handing out ``rewards`` in call order (one per
+    rollout), for the never-give-up tests. ``base_rewards``, when given,
+    sets ``reward/base`` the way reward shaping does; ``fail_on_call``
+    raises on that (0-based) call to simulate a crashed retry round."""
+    calls = [0]
+
+    async def fake_rollout_fn(
+        model: object, question: object, **kwargs: object
+    ) -> "art.Trajectory":
+        import art
+
+        i = calls[0]
+        calls[0] += 1
+        if fail_on_call is not None and i == fail_on_call:
+            raise RuntimeError("simulated rollout failure")
+        metrics: dict[str, float | int | bool] = {}
+        if base_rewards is not None:
+            metrics["reward/base"] = base_rewards[i]
+        return art.Trajectory(reward=rewards[i], metrics=metrics)
+
+    return fake_rollout_fn, calls
+
+
+async def _run_group(
+    monkeypatch: pytest.MonkeyPatch, fake_rollout_fn: Any, **kwargs: Any
+) -> "art.TrajectoryGroup":
+    from mas_deepr.data.schema import Question
+    from mas_deepr.rl import rollout as rollout_mod
+
+    monkeypatch.setattr(rollout_mod, "rollout_fn", fake_rollout_fn)
+    question = Question(
+        question_id="q1", source="musique", split="train", prompt="p", answer="Paris"
+    )
+    judge, tracker = _fake_judge_and_tracker()
+    return await rollout_mod.run_rollout_group(
+        _make_model(monkeypatch),  # type: ignore[arg-type]
+        question,
+        group_size=4,
+        judge=judge,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_never_give_up_off_keeps_single_round_and_no_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default off: an all-failed group is returned as-is (one round, no
+    ngu/* metrics), i.e. the other arms behave exactly as before."""
+    fake, calls = _scripted_rollout_fn([0.0] * 12)
+    group = await _run_group(monkeypatch, fake)
+    assert calls[0] == 4
+    assert len(group.trajectories) == 4
+    assert all("ngu/extra_rounds" not in t.metrics for t in group.trajectories)
+
+
+@pytest.mark.asyncio
+async def test_never_give_up_no_retry_when_first_round_has_a_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake, calls = _scripted_rollout_fn([0.0, 1.0, 0.0, 0.0] + [0.0] * 8)
+    group = await _run_group(monkeypatch, fake, never_give_up=True)
+    assert calls[0] == 4
+    assert len(group.trajectories) == 4
+    assert all(t.metrics["ngu/extra_rounds"] == 0.0 for t in group.trajectories)
+    assert all(t.metrics["ngu/solved_on_retry"] == 0.0 for t in group.trajectories)
+
+
+@pytest.mark.asyncio
+async def test_never_give_up_stops_after_first_successful_retry_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All-failed first round -> one retry round that contains a success ->
+    stop there and train on all 8 rollouts as one group."""
+    fake, calls = _scripted_rollout_fn([0.0] * 4 + [0.0, 0.0, 1.0, 0.0] + [0.0] * 4)
+    group = await _run_group(monkeypatch, fake, never_give_up=True)
+    assert calls[0] == 8
+    assert len(group.trajectories) == 8
+    assert sorted(t.reward for t in group.trajectories) == [0.0] * 7 + [1.0]
+    assert all(t.metrics["ngu/extra_rounds"] == 1.0 for t in group.trajectories)
+    assert all(t.metrics["ngu/solved_on_retry"] == 1.0 for t in group.trajectories)
+
+
+@pytest.mark.asyncio
+async def test_never_give_up_respects_max_extra_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never solved: exactly 1 + ngu_max_extra_rounds rounds, then the
+    all-zero group is returned for GRPO to drop as usual."""
+    fake, calls = _scripted_rollout_fn([0.0] * 20)
+    group = await _run_group(
+        monkeypatch, fake, never_give_up=True, ngu_max_extra_rounds=2
+    )
+    assert calls[0] == 12
+    assert len(group.trajectories) == 12
+    assert all(t.metrics["ngu/extra_rounds"] == 2.0 for t in group.trajectories)
+    assert all(t.metrics["ngu/solved_on_retry"] == 0.0 for t in group.trajectories)
+
+
+@pytest.mark.asyncio
+async def test_never_give_up_judges_success_before_reward_shaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A correct answer whose penalties clip the shaped reward to 0 still
+    counts as solved (``reward/base`` > 0) -- no pointless retry."""
+    fake, calls = _scripted_rollout_fn(
+        [0.0] * 12, base_rewards=[0.0, 1.0, 0.0, 0.0] + [0.0] * 8
+    )
+    group = await _run_group(monkeypatch, fake, never_give_up=True)
+    assert calls[0] == 4
+    assert len(group.trajectories) == 4
+
+
+@pytest.mark.asyncio
+async def test_never_give_up_failed_retry_round_keeps_earlier_rollouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash in a retry round drops only the crashed rollout and ends
+    retrying; the first round and the retry round's other rollouts stay."""
+    fake, calls = _scripted_rollout_fn([0.0] * 12, fail_on_call=5)
+    group = await _run_group(monkeypatch, fake, never_give_up=True)
+    assert calls[0] == 8  # no third round after the failure
+    assert len(group.trajectories) == 7
+    assert all(t.metrics["ngu/extra_rounds"] == 1.0 for t in group.trajectories)
+    assert all(t.metrics["ngu/solved_on_retry"] == 0.0 for t in group.trajectories)
+
+
+@pytest.mark.asyncio
+async def test_never_give_up_rejects_negative_max_extra_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake, _calls = _scripted_rollout_fn([0.0] * 4)
+    with pytest.raises(ValueError, match="ngu_max_extra_rounds"):
+        await _run_group(monkeypatch, fake, never_give_up=True, ngu_max_extra_rounds=-1)
+
+
 class _FakeJudgeWithHallucinationCheck:
     """Duck-typed stand-in with just enough surface for the shaping tests
     below -- grade_hallucination is the only method rollout_fn actually

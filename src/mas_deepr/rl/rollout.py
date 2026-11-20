@@ -26,6 +26,7 @@ logprobs, coarse cross-role credit assignment) still unverified/simplified.
 
 import asyncio
 import json
+import logging
 from typing import Any, cast
 
 import art
@@ -48,6 +49,8 @@ from mas_deepr.rl.rubric_reward import (
     score_rollout_group_verifiable,
 )
 from mas_deepr.telemetry import TelemetryTracker
+
+logger = logging.getLogger(__name__)
 
 # PEP 695 `type` statement, not a bare `X = A | B` -- required here
 # specifically because ArtMessage comes from a module CI's mypy run
@@ -413,6 +416,8 @@ async def run_rollout_group(
     turn_penalty_weight: float = 0.03,
     penalize_hallucination: bool = False,
     hallucination_penalty_weight: float = 0.15,
+    never_give_up: bool = False,
+    ngu_max_extra_rounds: int = 2,
 ) -> art.TrajectoryGroup:
     """Run ``group_size`` rollouts of the same question concurrently --
     one GRPO group.
@@ -441,7 +446,27 @@ async def run_rollout_group(
     ``penalize_turns``/``penalize_hallucination`` and their weights pass
     straight through to every rollout in the group -- see
     ``rollout_fn``'s docstring.
+
+    ``never_give_up`` (default off, so other arms behave exactly as before)
+    is a synchronous, capped variant of Never Give Up ("Learning to Solve
+    Hard Problems in RL for LLMs by Never Giving Up", arXiv:2609.13443):
+    when no rollout of the first round succeeds (see
+    ``_ngu_success``), up to ``ngu_max_extra_rounds`` more rounds of
+    ``group_size`` rollouts run, stopping after the first round with a
+    success, and every rollout gathered becomes ONE larger GRPO group --
+    so the rare correct answer gets a large positive advantage instead of
+    the all-zero group being dropped. Differences from the paper, which
+    runs asynchronously: retries happen inside the same training step, so
+    every rollout comes from the current policy (no stale-completion
+    filtering or negative-advantage rescaling needed), and the retry
+    budget is a hard cap rather than the paper's geometric
+    continue-with-probability-p rule. A question still unsolved after the
+    cap keeps its all-zero group, which GRPO drops as before. Every
+    trajectory in the group carries ``ngu/extra_rounds`` and
+    ``ngu/solved_on_retry`` metrics for W&B.
     """
+    if ngu_max_extra_rounds < 0:
+        raise ValueError("ngu_max_extra_rounds must be >= 0")
 
     async def _one_rollout() -> art.Trajectory:
         if llm_semaphore is None:
@@ -471,7 +496,54 @@ async def run_rollout_group(
                 hallucination_penalty_weight=hallucination_penalty_weight,
             )
 
-    trajectories: list[Any] = await asyncio.gather(
-        *(_one_rollout() for _ in range(group_size))
+    trajectories: list[Any] = list(
+        await asyncio.gather(*(_one_rollout() for _ in range(group_size)))
     )
+    if never_give_up:
+        extra_rounds = 0
+        while extra_rounds < ngu_max_extra_rounds and not any(
+            _ngu_success(t) for t in trajectories
+        ):
+            extra_rounds += 1
+            # The first round's exceptions still propagate to
+            # art.gather_trajectory_groups' max_exceptions accounting, exactly
+            # as without NGU. In a *retry* round, a crashed rollout is
+            # dropped, the round's other rollouts are kept, and retrying
+            # stops -- repeated failures are more likely a broken tool or
+            # server than bad luck, so more retries would only burn compute.
+            results = await asyncio.gather(
+                *(_one_rollout() for _ in range(group_size)),
+                return_exceptions=True,
+            )
+            failures = [r for r in results if isinstance(r, BaseException)]
+            trajectories.extend(r for r in results if not isinstance(r, BaseException))
+            if failures:
+                logger.warning(
+                    "never-give-up: %d of %d rollouts failed in retry round %d "
+                    "for question %s; stopping retries with %d rollouts",
+                    len(failures),
+                    group_size,
+                    extra_rounds,
+                    question.question_id,
+                    len(trajectories),
+                    exc_info=failures[0],
+                )
+                break
+        solved_on_retry = extra_rounds > 0 and any(
+            _ngu_success(t) for t in trajectories
+        )
+        for t in trajectories:
+            t.metrics["ngu/extra_rounds"] = float(extra_rounds)
+            t.metrics["ngu/solved_on_retry"] = float(solved_on_retry)
     return art.TrajectoryGroup(trajectories=trajectories)
+
+
+def _ngu_success(trajectory: art.Trajectory) -> bool:
+    """Whether a rollout counts as solved for never-give-up purposes: its
+    primary score (exact match or rubric score) is above 0, judged *before*
+    reward shaping -- a correct answer whose turn/hallucination penalties
+    clip the shaped reward to 0 still means the question is solvable, so
+    retrying it would only buy more rollouts of an already-solved question.
+    ``reward/base`` is only present when shaping is on; without shaping the
+    reward is the primary score itself."""
+    return float(trajectory.metrics.get("reward/base", trajectory.reward)) > 0.0

@@ -52,6 +52,7 @@ Usage:
 import argparse
 import asyncio
 import itertools
+import os
 import random
 from typing import Any
 
@@ -69,11 +70,24 @@ from mas_deepr.telemetry import TelemetryTracker, WandbSink, wandb_enabled
 
 def _make_backend(kind: str) -> Any:
     if kind == "serverless":
-        return ServerlessBackend()
+        # Optional override of ART's built-in https://api.training.wandb.ai/v1,
+        # e.g. CoreWeave Forge's documented https://forge.coreweave.com/api/training/v1.
+        # Unset -> ART's default address, exactly as before.
+        return ServerlessBackend(
+            base_url=os.environ.get("ART_SERVERLESS_BASE_URL") or None
+        )
     if kind == "local":
         from art.local import LocalBackend
 
         return LocalBackend()
+    if kind == "tinker":
+        # Thinking Machines' Tinker: hosted inference + LoRA training.
+        # Needs TINKER_API_KEY in .env and the separate .venv-tinker env
+        # (openpipe-art[tinker] pins torch/transformers/numpy versions that
+        # conflict with the rl-art extra).
+        from art.tinker import TinkerBackend
+
+        return TinkerBackend()
     raise ValueError(f"unknown backend {kind!r}")
 
 
@@ -134,7 +148,7 @@ async def main() -> None:
         "--prefer-compiled", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
-        "--backend", choices=("serverless", "local"), default="serverless"
+        "--backend", choices=("serverless", "local", "tinker"), default="serverless"
     )
     parser.add_argument(
         "--penalize-turns",
@@ -155,6 +169,23 @@ async def main() -> None:
     )
     parser.add_argument("--hallucination-penalty-weight", type=float, default=0.15)
     parser.add_argument(
+        "--never-give-up",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Never Give Up (arXiv:2609.13443), synchronous and capped: when "
+        "no rollout of a question succeeds, run up to --ngu-max-extra-rounds "
+        "more rounds of --group-size rollouts and train on all of them as "
+        "one larger group. Off by default -- see rl/rollout.py::"
+        "run_rollout_group.",
+    )
+    parser.add_argument(
+        "--ngu-max-extra-rounds",
+        type=int,
+        default=2,
+        help="Retry cap per question for --never-give-up (default 2: at most "
+        "3x --group-size rollouts per question).",
+    )
+    parser.add_argument(
         "--r2-sync",
         action="store_true",
         help="When the run finishes, upload its output folder plus the W&B "
@@ -162,6 +193,8 @@ async def main() -> None:
         "the R2 vars in .env). Failures only warn.",
     )
     args = parser.parse_args()
+    if args.ngu_max_extra_rounds < 0:
+        raise SystemExit("--ngu-max-extra-rounds must be >= 0")
 
     configure_logging()
     settings = get_settings()
@@ -227,6 +260,8 @@ async def main() -> None:
             "turn_penalty_weight": args.turn_penalty_weight,
             "penalize_hallucination": args.penalize_hallucination,
             "hallucination_penalty_weight": args.hallucination_penalty_weight,
+            "never_give_up": args.never_give_up,
+            "ngu_max_extra_rounds": args.ngu_max_extra_rounds,
         }
     )
     backend = _make_backend(args.backend)
@@ -263,6 +298,8 @@ async def main() -> None:
                 turn_penalty_weight=args.turn_penalty_weight,
                 penalize_hallucination=args.penalize_hallucination,
                 hallucination_penalty_weight=args.hallucination_penalty_weight,
+                never_give_up=args.never_give_up,
+                ngu_max_extra_rounds=args.ngu_max_extra_rounds,
             )
             for q in batch
         ]
@@ -306,6 +343,11 @@ async def main() -> None:
             f"{len(trajectory_groups)} question groups -> checkpoint step "
             f"{step_num} ({args.backend} backend)."
         )
+        if args.backend == "tinker":
+            # Tinker's free storage tier stops training at 100 checkpoints
+            # and ART saves one per step; keep only the latest (and best,
+            # if a val metric is logged).
+            await model.delete_checkpoints()
 
     with WandbSink(
         project=settings.wandb_project,
