@@ -236,3 +236,52 @@ def test_main_sets_gpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     assert rq.main(["--dry-run"]) == 0
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
     assert os.environ["ART_MEGATRON_CACHE_ROOT"].endswith(os.path.join(".cache", "art"))
+
+
+def test_trainer_runs_4bit_and_every_local_job_matches() -> None:
+    """Training, evaluation and DSPy all pass --load-in-4bit, so each
+    checkpoint is served with the settings it was trained with."""
+    cfg = rq.QueueConfig(python="py")
+    assert "--load-in-4bit" in rq.train_argv(cfg, "s1-baseline", done_steps=0)
+    for job in rq.build_plan(cfg, project="p"):
+        if job.argv and ("eval_grpo" in job.argv[1] or "compile_dspy" in job.argv[1]):
+            assert "--load-in-4bit" in job.argv, job.job_id
+
+
+def test_run_tag_gives_fresh_names_and_state() -> None:
+    cfg = rq.QueueConfig(python="py", run_tag="v2")
+    assert cfg.model("s1-baseline") == "qwen4b-s1-baseline-v2"
+    assert cfg.tag == "main-v2"
+    smoke = rq.QueueConfig(python="py", run_tag="v2", smoke=True)
+    assert smoke.model("s4-rubrics") == "qwen4b-s4-rubrics-v2-smoke"
+    assert smoke.tag == "smoke-v2"
+    argv = rq.train_argv(cfg, "s2-shaping", done_steps=0)
+    assert argv[argv.index("--model-name") + 1] == "qwen4b-s2-shaping-v2"
+    jobs = {j.job_id: j for j in rq.build_plan(cfg, project="p")}
+    assert ".art/p/models/qwen4b-s1-baseline-v2" in jobs["s1-baseline:sync"].argv
+    compile_argv = jobs["dspy:compile"].argv
+    assert compile_argv[compile_argv.index("--grpo-model-name") + 1] == (
+        "qwen4b-s4-rubrics-v2"
+    )
+    assert "qwen4b-s4-rubrics-v2-folding-dspy" in jobs["dspy:eval"].argv
+    # no tag -> the original names
+    assert rq.QueueConfig(python="py").model("s1-baseline") == "qwen4b-s1-baseline"
+
+
+def test_run_tag_resumes_only_its_own_checkpoints(tmp_path: Path) -> None:
+    cfg = rq.QueueConfig(python="py", stages=["s1-baseline"], run_tag="v2")
+    # the old, untagged run's checkpoints must not be resumed by v2
+    (tmp_path / "models" / "qwen4b-s1-baseline" / "checkpoints" / "0015").mkdir(
+        parents=True
+    )
+    _, calls = _run(tmp_path, cfg, {})
+    train = calls[0]
+    assert train[train.index("--skip-batches") + 1] == "0"
+    assert train[train.index("--model-name") + 1] == "qwen4b-s1-baseline-v2"
+
+
+def test_invalid_run_tag_rejected() -> None:
+    assert rq.valid_run_tag("v2") and rq.valid_run_tag("") and rq.valid_run_tag("a_b-3")
+    assert not rq.valid_run_tag("v 2") and not rq.valid_run_tag("../x")
+    with pytest.raises(SystemExit):
+        rq.main(["--dry-run", "--run-tag", "a/b"])

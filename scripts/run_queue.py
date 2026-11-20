@@ -62,9 +62,20 @@ STAGES: list[tuple[str, list[str]]] = [
 ]
 DSPY_STAGE = "s4-rubrics"
 
+# The trainer (Unsloth) loads the frozen base model in 4-bit NF4 (QLoRA) --
+# ART's own default. In bf16 the 4B model plus a 12K-token training step
+# needs more than the L4's 22 GB (first real run, 2026-11-20: out of memory
+# at 20.3 GB in ART's log-prob pass, even with the sequence cap). Only the
+# trainer is affected: vLLM gets ART's engine_args, which set no
+# quantization, so rollouts and all evaluations run the bf16 base + LoRA.
+# Passed to evaluation and DSPy too, so a checkpoint is served with the
+# settings it was trained with.
+LOCAL_MODEL_FLAGS = ["--load-in-4bit"]
+
 COMMON_TRAIN_FLAGS = [
     "--base-model", BASE_MODEL,
     "--backend", "local",
+    *LOCAL_MODEL_FLAGS,
     "--memory", MEMORY,
     "--group-size", "4",
     "--seed", "1",
@@ -101,14 +112,26 @@ class QueueConfig:
     dspy: bool = True
     dspy_auto: str = "medium"
     python: str = sys.executable
+    run_tag: str = ""  # e.g. "v2": new model names, W&B runs and queue state
 
     @property
     def tag(self) -> str:
-        return "smoke" if self.smoke else "main"
+        base = "smoke" if self.smoke else "main"
+        return f"{base}-{self.run_tag}" if self.run_tag else base
+
+    def model(self, stage: str) -> str:
+        return model_name(stage, smoke=self.smoke, run_tag=self.run_tag)
 
 
-def model_name(stage: str, *, smoke: bool) -> str:
-    return f"{MODEL_PREFIX}-{stage}" + ("-smoke" if smoke else "")
+def model_name(stage: str, *, smoke: bool, run_tag: str = "") -> str:
+    """``qwen4b-<stage>[-<run_tag>][-smoke]`` -- the ART model, its
+    checkpoint folder and its W&B run all use this name."""
+    tag = f"-{run_tag}" if run_tag else ""
+    return f"{MODEL_PREFIX}-{stage}{tag}" + ("-smoke" if smoke else "")
+
+
+def valid_run_tag(tag: str) -> bool:
+    return tag == "" or all(c.isalnum() or c in "-_" for c in tag)
 
 
 def stage_train_flags(stage: str) -> list[str]:
@@ -142,7 +165,7 @@ def train_argv(cfg: QueueConfig, stage: str, *, done_steps: int) -> list[str] | 
     return [
         cfg.python,
         "scripts/train_grpo.py",
-        "--model-name", model_name(stage, smoke=cfg.smoke),
+        "--model-name", cfg.model(stage),
         *COMMON_TRAIN_FLAGS,
         "--batch-size", str(cfg.batch_size),
         "--num-steps", str(remaining),
@@ -152,13 +175,14 @@ def train_argv(cfg: QueueConfig, stage: str, *, done_steps: int) -> list[str] | 
 
 
 def eval_argv(cfg: QueueConfig, stage: str, *, compiled: bool = False) -> list[str]:
-    name = model_name(stage, smoke=cfg.smoke)
+    name = cfg.model(stage)
     argv = [
         cfg.python,
         "scripts/eval_grpo_checkpoint.py",
         "--model-name", name,
         "--base-model", BASE_MODEL,
         "--backend", "local",
+        *LOCAL_MODEL_FLAGS,
         "--memory", MEMORY,
         "--r2-sync",
     ]  # fmt: skip
@@ -178,7 +202,7 @@ def build_plan(cfg: QueueConfig, *, project: str) -> list[Job]:
     depends on the checkpoint already on disk), so it's a placeholder here."""
     jobs: list[Job] = []
     for stage in cfg.stages:
-        name = model_name(stage, smoke=cfg.smoke)
+        name = cfg.model(stage)
         jobs.append(Job(f"{stage}:train", [], stage=stage))
         jobs.append(Job(f"{stage}:eval", eval_argv(cfg, stage), [f"{stage}:train"]))
         jobs.append(
@@ -189,13 +213,14 @@ def build_plan(cfg: QueueConfig, *, project: str) -> list[Job]:
             )
         )
     if cfg.dspy and DSPY_STAGE in cfg.stages:
-        name = model_name(DSPY_STAGE, smoke=cfg.smoke)
+        name = cfg.model(DSPY_STAGE)
         compile_argv = [
             cfg.python,
             "scripts/compile_dspy.py",
             "--grpo-model-name", name,
             "--base-model", BASE_MODEL,
             "--backend", "local",
+            *LOCAL_MODEL_FLAGS,
             "--auto", "light" if cfg.smoke else cfg.dspy_auto,
         ]  # fmt: skip
         if cfg.smoke:
@@ -287,9 +312,7 @@ def run_plan(
             continue
         argv = job.argv
         if job.stage is not None:
-            done_steps = latest_checkpoint_step(
-                art_models_dir, model_name(job.stage, smoke=cfg.smoke)
-            )
+            done_steps = latest_checkpoint_step(art_models_dir, cfg.model(job.stage))
             maybe = train_argv(cfg, job.stage, done_steps=done_steps)
             if maybe is None:  # trained to the target already
                 state.set(job.job_id, "done")
@@ -383,6 +406,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--no-dspy", action="store_true", help="Skip the DSPy jobs")
     parser.add_argument(
+        "--run-tag",
+        default="",
+        help="Suffix for a fresh set of runs, e.g. 'v2': every stage trains a "
+        "new model (qwen4b-<stage>-v2) with its own W&B run, checkpoints and "
+        "queue state; earlier runs are left untouched.",
+    )
+    parser.add_argument(
         "--dspy-auto", choices=("light", "medium", "heavy"), default="medium"
     )
     parser.add_argument(
@@ -409,6 +439,8 @@ def main(argv: list[str] | None = None) -> int:
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
     for s in stages:
         stage_train_flags(s)  # validates the name
+    if not valid_run_tag(args.run_tag):
+        raise SystemExit("--run-tag may contain only letters, digits, '-' and '_'")
     cfg = QueueConfig(
         steps=2 if args.smoke else args.steps,
         batch_size=2 if args.smoke else args.batch_size,
@@ -416,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         stages=stages,
         dspy=not args.no_dspy,
         dspy_auto=args.dspy_auto,
+        run_tag=args.run_tag,
     )
 
     os.environ.setdefault("ART_MEGATRON_CACHE_ROOT", str(ART_CACHE_DIR))
@@ -441,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
                 cfg,
                 job.stage or "",
                 done_steps=latest_checkpoint_step(
-                    art_models_dir, model_name(job.stage or "", smoke=cfg.smoke)
+                    art_models_dir, cfg.model(job.stage or "")
                 ),
             )
             print(f"[{job.job_id}] {' '.join(argv_ or ['(nothing left to train)'])}")
