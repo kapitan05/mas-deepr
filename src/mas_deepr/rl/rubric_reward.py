@@ -8,11 +8,13 @@ model as judge keeps judging cost near zero during training (DR Tulu's own
 ablation: ~1pt loss vs GPT-4.1) -- pass a ``JudgeClient`` built against the
 policy model itself, not necessarily a separate frontier judge.
 
-Deliberately scoped down from DR Tulu's own ~27,000 GPU-hr run and dynamic
-rubric-pool *generation* -- this module assumes a fixed rubric pool per
-question (e.g. from ResearchRubrics or a hand-authored pool) and focuses on
-the scoring/credit-assignment mechanics plan-v2.md's gradient-mechanics
-section actually needs, not on rubric synthesis.
+Deliberately scoped down from DR Tulu's own ~27,000 GPU-hr run: each
+question's dataset rubrics act as the fixed ("persistent") pool, and the
+optional evolving-rubrics arm (``combine_with_evolving_rubrics`` here,
+``JudgeClient.generate_evolving_rubrics``, wired up in
+``rl/rollout.py::run_rollout_group``) adds per-group generated criteria on
+top -- without the paper's search-based initial rubrics, citation/format
+rewards, or a buffer that accumulates across repeated visits.
 """
 
 import statistics
@@ -20,7 +22,7 @@ from dataclasses import dataclass
 
 from mas_deepr.data.schema import RubricCriterion
 from mas_deepr.evals.graders import exact_match, extract_final_answer
-from mas_deepr.evals.judge import JudgeClient
+from mas_deepr.evals.judge import JudgeClient, _weighted_rubric_score
 
 
 @dataclass
@@ -104,6 +106,39 @@ def prune_zero_variance_rubrics(
         if column and len(set(column)) > 1:
             keep.append(rubric)
     return keep
+
+
+def combine_with_evolving_rubrics(
+    *,
+    persistent: list[RubricCriterion],
+    persistent_verdicts: list[list[bool]],
+    evolving: list[RubricCriterion],
+    evolving_verdicts: list[list[bool]],
+) -> tuple[list[RubricCriterion], list[float]]:
+    """RLER-style group score (DR Tulu, arXiv:2511.19399): drop the newly
+    generated rubrics that every rollout in the group passed or every
+    rollout failed (zero variance -- no learning signal, the paper's own
+    pruning rule), then score each rollout against persistent + kept
+    evolving rubrics with the same signed-weight formula as every other
+    rubric score (``evals/judge.py::_weighted_rubric_score``).
+
+    ``*_verdicts`` hold one list per rollout, aligned with the rubric
+    lists. Returns ``(kept_evolving, scores)``. With nothing kept, the
+    scores equal the persistent-only scores exactly.
+    """
+    if len(persistent_verdicts) != len(evolving_verdicts):
+        raise ValueError("persistent and evolving verdicts cover different rollouts")
+    kept_idx = [
+        i
+        for i in range(len(evolving))
+        if len({v[i] for v in evolving_verdicts if i < len(v)}) > 1
+    ]
+    kept = [evolving[i] for i in kept_idx]
+    scores = [
+        _weighted_rubric_score(persistent + kept, p + [e[i] for i in kept_idx])
+        for p, e in zip(persistent_verdicts, evolving_verdicts, strict=True)
+    ]
+    return kept, scores
 
 
 def apply_reward_shaping(

@@ -881,3 +881,220 @@ def test_build_trajectory_keeps_leaked_tool_call_text_and_recovery_turn() -> Non
     assert leaked in contents
     assert contents.index(leaked) < contents.index("Paris is in France.")
     assert trajectory.metrics["num_role_turns"] == 2.0
+
+
+class _FakeEvolvingJudge:
+    """Judge stand-in for the evolving-rubrics path: hands out fixed new
+    rubrics and grades each response from a per-answer verdict table."""
+
+    def __init__(
+        self, new_rubrics: list[Any], verdicts_by_answer: dict[str, list[bool]]
+    ) -> None:
+        self.new_rubrics = new_rubrics
+        self.verdicts_by_answer = verdicts_by_answer
+        self.generate_calls: list[dict[str, Any]] = []
+        self.grade_calls = 0
+
+    async def generate_evolving_rubrics(self, **kwargs: Any) -> list[Any]:
+        self.generate_calls.append(kwargs)
+        return self.new_rubrics
+
+    async def grade_research_rubrics(
+        self, *, prompt: str, rubrics: list[Any], response: str, question_id: str
+    ) -> tuple[float, list[dict[str, Any]]]:
+        self.grade_calls += 1
+        verdicts = self.verdicts_by_answer[response]
+        return 0.0, [
+            {"criterion": r.criterion, "satisfied": v}
+            for r, v in zip(rubrics, verdicts, strict=True)
+        ]
+
+
+def _scripted_rubric_rollout(
+    plan: list[tuple[str, float, list[bool], int]],
+) -> tuple[Any, list[int]]:
+    """Fake ``_rubric_rollout`` handing out ``(final_answer,
+    persistent_score, persistent_verdicts, num_role_turns)`` in call order."""
+    calls = [0]
+
+    async def fake(model: object, question: object, **kwargs: object) -> Any:
+        from mas_deepr.agents.topology import AgentTurn, PipelineResult
+        from mas_deepr.rl.rollout import _RubricRollout
+
+        answer, score, verdicts, turns = plan[calls[0]]
+        calls[0] += 1
+        turn = AgentTurn(text="x", messages=[])
+        return _RubricRollout(
+            result=PipelineResult(
+                question_id="q1",
+                question="p",
+                final_answer=answer,
+                findings=[f"evidence for {answer}"],
+                role_turns=[("manager", turn)] * turns,
+            ),
+            persistent_score=score,
+            persistent_verdicts=verdicts,
+            is_hallucinating=False,
+        )
+
+    return fake, calls
+
+
+def _rubric_question() -> Any:
+    from mas_deepr.data.schema import Question, RubricCriterion
+
+    return Question(
+        question_id="q1",
+        source="dr_tulu_rl_data",
+        split="train",
+        prompt="p",
+        rubrics=[RubricCriterion(criterion="covers X", weight=1.0, axis="a")],
+    )
+
+
+async def _run_evolving_group(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_rubric_rollout: Any,
+    judge: _FakeEvolvingJudge,
+    question: Any,
+    **kwargs: Any,
+) -> "art.TrajectoryGroup":
+    from mas_deepr.rl import rollout as rollout_mod
+
+    monkeypatch.setattr(rollout_mod, "_rubric_rollout", fake_rubric_rollout)
+    _judge, tracker = _fake_judge_and_tracker()
+    return await rollout_mod.run_rollout_group(
+        _make_model(monkeypatch),  # type: ignore[arg-type]
+        question,
+        group_size=4,
+        judge=judge,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+        evolving_rubrics=True,
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_evolving_rubrics_rescore_group_and_log_jsonl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import json
+
+    from mas_deepr.data.schema import RubricCriterion
+
+    new = [
+        RubricCriterion(criterion="cites study", weight=1.0, axis="evolving_positive"),
+        RubricCriterion(criterion="everyone does", weight=1.0, axis="evolving_x"),
+    ]
+    judge = _FakeEvolvingJudge(
+        new,
+        {
+            "a": [True, True],
+            "b": [False, True],
+            "c": [False, True],
+            "d": [True, True],
+        },
+    )
+    fake, _calls = _scripted_rubric_rollout(
+        [(ans, 1.0, [True], 3) for ans in ["a", "b", "c", "d"]]
+    )
+    log = tmp_path / "evolving.jsonl"
+    group = await _run_evolving_group(
+        monkeypatch, fake, judge, _rubric_question(), evolving_rubrics_log=log
+    )
+
+    # One generation call over all 4 rollouts, one grading call per rollout.
+    assert len(judge.generate_calls) == 1
+    assert len(judge.generate_calls[0]["candidates"]) == 4
+    assert judge.grade_calls == 4
+    # "everyone does" has zero variance -> pruned; "cites study" kept:
+    # persistent 1/1 plus kept 1 -> (1 + 1) / 2 or (1 + 0) / 2.
+    assert [t.reward for t in group.trajectories] == [1.0, 0.5, 0.5, 1.0]
+    m = group.trajectories[0].metrics
+    assert m["rubrics/evolving_generated"] == 2.0
+    assert m["rubrics/evolving_kept"] == 1.0
+    assert m["rubrics/persistent_score"] == 1.0
+    record = json.loads(log.read_text().strip())
+    assert record["question_id"] == "q1"
+    assert [r["criterion"] for r in record["kept"]] == ["cites study"]
+    assert record["combined_scores"] == [1.0, 0.5, 0.5, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_evolving_rubrics_no_new_rubrics_keeps_persistent_scores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = _FakeEvolvingJudge([], {})
+    fake, _calls = _scripted_rubric_rollout(
+        [("a", 1.0, [True], 3), ("b", 0.0, [False], 3)] * 2
+    )
+    group = await _run_evolving_group(monkeypatch, fake, judge, _rubric_question())
+    assert judge.grade_calls == 0
+    assert [t.reward for t in group.trajectories] == [1.0, 0.0, 1.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_evolving_rubrics_apply_reward_shaping_on_combined_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = _FakeEvolvingJudge([], {})
+    fake, _calls = _scripted_rubric_rollout([("a", 1.0, [True], 5)] * 4)
+    group = await _run_evolving_group(
+        monkeypatch,
+        fake,
+        judge,
+        _rubric_question(),
+        penalize_turns=True,
+        turn_penalty_weight=0.03,
+    )
+    # 5 role turns -> 2 past the floor -> 0.06 off the combined score of 1.0
+    assert all(t.reward == pytest.approx(0.94) for t in group.trajectories)
+    assert group.trajectories[0].metrics["reward/base"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_evolving_rubrics_with_never_give_up_retries_on_persistent_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NGU decides retries on the persistent-rubric score; the evolving
+    rubrics are then generated and graded over the whole enlarged group."""
+    judge = _FakeEvolvingJudge([], {})
+    plan = [("a", 0.0, [False], 3)] * 4 + [("b", 0.0, [False], 3)] * 3
+    plan += [("c", 1.0, [True], 3)]
+    fake, calls = _scripted_rubric_rollout(plan)
+    group = await _run_evolving_group(
+        monkeypatch, fake, judge, _rubric_question(), never_give_up=True
+    )
+    assert calls[0] == 8
+    assert len(judge.generate_calls[0]["candidates"]) == 8
+    assert len(group.trajectories) == 8
+    assert all(t.metrics["ngu/solved_on_retry"] == 1.0 for t in group.trajectories)
+
+
+@pytest.mark.asyncio
+async def test_evolving_rubrics_flag_ignored_for_exact_match_questions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mas_deepr.data.schema import Question
+    from mas_deepr.rl import rollout as rollout_mod
+
+    async def must_not_run(*args: object, **kwargs: object) -> None:
+        raise AssertionError("evolving path used for an exact-match question")
+
+    monkeypatch.setattr(rollout_mod, "_rubric_rollout", must_not_run)
+    fake, calls = _scripted_rollout_fn([1.0] * 4)
+    monkeypatch.setattr(rollout_mod, "rollout_fn", fake)
+    question = Question(
+        question_id="q1", source="musique", split="train", prompt="p", answer="Paris"
+    )
+    judge, tracker = _fake_judge_and_tracker()
+    group = await rollout_mod.run_rollout_group(
+        _make_model(monkeypatch),  # type: ignore[arg-type]
+        question,
+        group_size=4,
+        judge=judge,  # type: ignore[arg-type]
+        tracker=tracker,  # type: ignore[arg-type]
+        evolving_rubrics=True,
+    )
+    assert calls[0] == 4
+    assert len(group.trajectories) == 4

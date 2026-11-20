@@ -1,5 +1,6 @@
 from mas_deepr.data.schema import RubricCriterion
 from mas_deepr.evals.judge import (
+    _parse_evolving_rubrics,
     _parse_hallucination_verdict,
     _parse_rubric_verdicts,
     _weighted_rubric_score,
@@ -85,3 +86,35 @@ def test_parse_hallucination_verdict_malformed_defaults_to_not_hallucinating() -
 
 def test_parse_hallucination_verdict_missing_key_defaults_false() -> None:
     assert _parse_hallucination_verdict("{}") is False
+
+
+def test_parse_evolving_rubrics_signed_weights_and_axes() -> None:
+    raw = (
+        'Sure:\n[{"type": "positive", "criterion": "Names the 2019 cohort study"},'
+        ' {"type": "negative", "criterion": "Copies evidence verbatim"}]'
+    )
+    rubrics = _parse_evolving_rubrics(raw, max_new=5)
+    assert [(r.criterion, r.weight, r.axis) for r in rubrics] == [
+        ("Names the 2019 cohort study", 1.0, "evolving_positive"),
+        ("Copies evidence verbatim", -1.0, "evolving_negative"),
+    ]
+
+
+def test_parse_evolving_rubrics_skips_bad_entries_and_duplicates() -> None:
+    raw = (
+        '[{"type": "positive", "criterion": "A"}, {"type": "neutral", "criterion":'
+        ' "B"}, {"type": "positive", "criterion": ""}, "junk",'
+        ' {"type": "Positive", "criterion": "a"}, {"type": "negative"}]'
+    )
+    rubrics = _parse_evolving_rubrics(raw, max_new=5)
+    assert [r.criterion for r in rubrics] == ["A"]
+
+
+def test_parse_evolving_rubrics_caps_at_max_new() -> None:
+    items = ", ".join(f'{{"type": "positive", "criterion": "c{i}"}}' for i in range(8))
+    assert len(_parse_evolving_rubrics(f"[{items}]", max_new=5)) == 5
+
+
+def test_parse_evolving_rubrics_unparseable_returns_empty() -> None:
+    assert _parse_evolving_rubrics("no json here", max_new=5) == []
+    assert _parse_evolving_rubrics("[not, valid json]", max_new=5) == []

@@ -65,6 +65,10 @@ def _build_parser(module: object) -> argparse.ArgumentParser:
         "--never-give-up", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--ngu-max-extra-rounds", type=int, default=2)
+    parser.add_argument(
+        "--evolving-rubrics", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--evolving-rubrics-max", type=int, default=5)
     return parser
 
 
@@ -247,3 +251,21 @@ def test_never_give_up_flags_are_wired_into_the_real_script() -> None:
     assert "never_give_up=args.never_give_up" in source
     assert "ngu_max_extra_rounds=args.ngu_max_extra_rounds" in source
     assert '"never_give_up": args.never_give_up' in source
+
+
+def test_evolving_rubrics_flags_default_off() -> None:
+    module = _load_train_grpo()
+    parser = _build_parser(module)
+    args = parser.parse_args(["--base-model", "b"])
+    assert args.evolving_rubrics is False
+    assert args.evolving_rubrics_max == 5
+
+
+def test_evolving_rubrics_flags_are_wired_into_the_real_script() -> None:
+    source = _SCRIPT_PATH.read_text()
+    assert '"--evolving-rubrics"' in source
+    assert '"--evolving-rubrics-max"' in source
+    assert "evolving_rubrics=args.evolving_rubrics" in source
+    assert "evolving_rubrics_max=args.evolving_rubrics_max" in source
+    assert "evolving_rubrics_log=evolving_rubrics_log" in source
+    assert '"evolving_rubrics": args.evolving_rubrics' in source

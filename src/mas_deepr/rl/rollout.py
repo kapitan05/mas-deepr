@@ -25,8 +25,12 @@ logprobs, coarse cross-role credit assignment) still unverified/simplified.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 import art
@@ -45,6 +49,7 @@ from mas_deepr.data.schema import Question
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.rl.rubric_reward import (
     apply_reward_shaping,
+    combine_with_evolving_rubrics,
     score_rollout_group,
     score_rollout_group_verifiable,
 )
@@ -306,51 +311,12 @@ async def rollout_fn(
     hallucination check reuses this same ``judge`` (one extra judge call
     per rollout only when the flag is on), not a separate provider.
     """
-    # model.inference_model_name is UNVERSIONED (no :stepN suffix) --
-    # confirmed live 2026-09-28 that ART's ServerlessBackend rejects it
-    # outright for inference ("LoRA inference requires an explicit
-    # checkpoint... Unversioned references and aliases such as 'latest'
-    # are not supported"), even for a model that has never been trained: a
-    # fresh registration IS servable, but only via the explicit
-    # ``:step0`` reference, which the server auto-provisions as the base
-    # weights. get_inference_name(step=...) is the versioned name that
-    # actually works -- matches OpenPipe's own reference training loop
-    # (`start_step = await model.get_step()` immediately after
-    # registration, before any rollout).
-    step = await model.get_step()
-    settings = Settings(
-        slm_base_url=model.inference_base_url or "",
-        slm_api_key=model.inference_api_key or "EMPTY",
-        slm_model=model.get_inference_name(step=step),
-        mcp_enabled_tools=get_tool_scope(tool_scope),
-    )
-    # Endpoint/name come from ART; *behaviour* (tool-call quirks, code-exec
-    # support, context window) from the registry entry for the same base
-    # model -- e.g. Llama 3.1 8B needs single_tool_call_per_turn and
-    # supports_code_exec=False here exactly as in evals, or rollouts 400 on
-    # multi-call turns / garble run_python. Unknown base models keep the
-    # previous defaults (family="qwen3", everything else ModelSpec's own).
-    spec = ModelSpec(
-        **{
-            "family": "qwen3",
-            **behaviour_for_model_id(str(getattr(model, "base_model", "") or "")),
-            "key": model.name,
-            "model_id": settings.slm_model,
-        }
-    )
-    pipeline = build_pipeline(
-        spec=spec,
-        settings=settings,
+    result = await _run_rollout_pipeline(
+        model,
+        question,
         tracker=tracker,
+        tool_scope=tool_scope,
         prefer_compiled=prefer_compiled,
-        trainable=True,
-    )
-
-    result = await run_pipeline(
-        pipeline,
-        question.prompt,
-        question_id=question.question_id,
-        capture_logprobs=True,
     )
 
     if question.rubrics is not None:
@@ -402,6 +368,252 @@ async def rollout_fn(
     )
 
 
+async def _run_rollout_pipeline(
+    model: art.TrainableModel,
+    question: Question,
+    *,
+    tracker: TelemetryTracker,
+    tool_scope: str,
+    prefer_compiled: bool,
+) -> PipelineResult:
+    """Run the MAS pipeline once against ``model``'s current checkpoint --
+    the ungraded half of a rollout, shared by ``rollout_fn`` and the
+    evolving-rubrics path in ``run_rollout_group``."""
+    # model.inference_model_name is UNVERSIONED (no :stepN suffix) --
+    # confirmed live 2026-09-28 that ART's ServerlessBackend rejects it
+    # outright for inference ("LoRA inference requires an explicit
+    # checkpoint... Unversioned references and aliases such as 'latest'
+    # are not supported"), even for a model that has never been trained: a
+    # fresh registration IS servable, but only via the explicit
+    # ``:step0`` reference, which the server auto-provisions as the base
+    # weights. get_inference_name(step=...) is the versioned name that
+    # actually works -- matches OpenPipe's own reference training loop
+    # (`start_step = await model.get_step()` immediately after
+    # registration, before any rollout).
+    step = await model.get_step()
+    settings = Settings(
+        slm_base_url=model.inference_base_url or "",
+        slm_api_key=model.inference_api_key or "EMPTY",
+        slm_model=model.get_inference_name(step=step),
+        mcp_enabled_tools=get_tool_scope(tool_scope),
+    )
+    # Endpoint/name come from ART; *behaviour* (tool-call quirks, code-exec
+    # support, context window) from the registry entry for the same base
+    # model -- e.g. Llama 3.1 8B needs single_tool_call_per_turn and
+    # supports_code_exec=False here exactly as in evals, or rollouts 400 on
+    # multi-call turns / garble run_python. Unknown base models keep the
+    # previous defaults (family="qwen3", everything else ModelSpec's own).
+    spec = ModelSpec(
+        **{
+            "family": "qwen3",
+            **behaviour_for_model_id(str(getattr(model, "base_model", "") or "")),
+            "key": model.name,
+            "model_id": settings.slm_model,
+        }
+    )
+    pipeline = build_pipeline(
+        spec=spec,
+        settings=settings,
+        tracker=tracker,
+        prefer_compiled=prefer_compiled,
+        trainable=True,
+    )
+
+    return await run_pipeline(
+        pipeline,
+        question.prompt,
+        question_id=question.question_id,
+        capture_logprobs=True,
+    )
+
+
+@dataclass
+class _RubricRollout:
+    """One ungraded-by-evolving-rubrics rollout of a rubric question: the
+    pipeline result, its verdicts on the question's own (persistent)
+    rubrics, and the hallucination flag when that penalty is on."""
+
+    result: PipelineResult
+    persistent_score: float
+    persistent_verdicts: list[bool]
+    is_hallucinating: bool
+
+
+async def _rubric_rollout(
+    model: art.TrainableModel,
+    question: Question,
+    *,
+    judge: JudgeClient,
+    tracker: TelemetryTracker,
+    tool_scope: str,
+    prefer_compiled: bool,
+    penalize_hallucination: bool,
+) -> _RubricRollout:
+    """Run + grade one rollout against the persistent rubrics only; the
+    evolving rubrics are added once the whole group is in (see
+    ``_finalize_with_evolving_rubrics``)."""
+    assert question.rubrics is not None
+    result = await _run_rollout_pipeline(
+        model,
+        question,
+        tracker=tracker,
+        tool_scope=tool_scope,
+        prefer_compiled=prefer_compiled,
+    )
+    score, details = await judge.grade_research_rubrics(
+        prompt=question.prompt,
+        rubrics=question.rubrics,
+        response=result.final_answer,
+        question_id=question.question_id,
+    )
+    is_hallucinating = False
+    if penalize_hallucination:
+        is_hallucinating = await judge.grade_hallucination(
+            question=question.prompt,
+            findings=result.findings,
+            response=result.final_answer,
+            question_id=question.question_id,
+        )
+    return _RubricRollout(
+        result=result,
+        persistent_score=score,
+        persistent_verdicts=[bool(d["satisfied"]) for d in details],
+        is_hallucinating=is_hallucinating,
+    )
+
+
+async def _finalize_with_evolving_rubrics(
+    rollouts: list[_RubricRollout],
+    question: Question,
+    *,
+    judge: JudgeClient,
+    max_new: int,
+    penalize_turns: bool,
+    turn_penalty_weight: float,
+    penalize_hallucination: bool,
+    hallucination_penalty_weight: float,
+    log_path: Path | None,
+) -> list[art.Trajectory]:
+    """Evolving-rubrics scoring for one finished group: generate new
+    rubrics from all its rollouts (one judge call), grade every rollout on
+    them (one judge call each), prune the zero-variance ones, score
+    persistent + kept rubrics together, then apply reward shaping on top
+    exactly as ``rollout_fn`` does."""
+    assert question.rubrics is not None
+    persistent = question.rubrics
+    evolving = await judge.generate_evolving_rubrics(
+        prompt=question.prompt,
+        rubrics=persistent,
+        candidates=[(r.result.findings, r.result.final_answer) for r in rollouts],
+        question_id=question.question_id,
+        max_new=max_new,
+    )
+    evolving_verdicts: list[list[bool]] = [[] for _ in rollouts]
+    if evolving:
+        graded = await asyncio.gather(
+            *(
+                judge.grade_research_rubrics(
+                    prompt=question.prompt,
+                    rubrics=evolving,
+                    response=r.result.final_answer,
+                    question_id=question.question_id,
+                )
+                for r in rollouts
+            )
+        )
+        evolving_verdicts = [[bool(d["satisfied"]) for d in g[1]] for g in graded]
+    kept, scores = combine_with_evolving_rubrics(
+        persistent=persistent,
+        persistent_verdicts=[r.persistent_verdicts for r in rollouts],
+        evolving=evolving,
+        evolving_verdicts=evolving_verdicts,
+    )
+
+    trajectories = []
+    for r, score in zip(rollouts, scores, strict=True):
+        reward = score
+        metrics: dict[str, float] = {
+            "rubrics/persistent_score": r.persistent_score,
+            "rubrics/evolving_generated": float(len(evolving)),
+            "rubrics/evolving_kept": float(len(kept)),
+        }
+        if penalize_turns or penalize_hallucination:
+            reward, shaping = apply_reward_shaping(
+                base_score=score,
+                num_role_turns=len(r.result.role_turns),
+                is_hallucinating=r.is_hallucinating,
+                turn_penalty_weight=turn_penalty_weight if penalize_turns else 0.0,
+                hallucination_penalty_weight=hallucination_penalty_weight,
+            )
+            metrics.update(shaping)
+        trajectories.append(
+            build_trajectory_from_result(
+                question=question.prompt,
+                result=r.result,
+                reward=reward,
+                extra_metrics=metrics,
+            )
+        )
+
+    if log_path is not None:
+        record = {
+            "question_id": question.question_id,
+            "generated": [r.model_dump() for r in evolving],
+            "kept": [r.model_dump() for r in kept],
+            "persistent_scores": [r.persistent_score for r in rollouts],
+            "combined_scores": scores,
+        }
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return trajectories
+
+
+async def _gather_rounds[T](
+    one: Callable[[], Awaitable[T]],
+    *,
+    group_size: int,
+    succeeded: Callable[[T], bool],
+    never_give_up: bool,
+    max_extra_rounds: int,
+    question_id: str,
+) -> tuple[list[T], int, bool]:
+    """One round of ``group_size`` concurrent rollouts, plus -- with
+    ``never_give_up`` -- up to ``max_extra_rounds`` retry rounds while
+    nothing has ``succeeded`` (see ``run_rollout_group``). Returns
+    ``(rollouts, extra_rounds, solved_on_retry)``."""
+    items: list[T] = list(await asyncio.gather(*(one() for _ in range(group_size))))
+    extra_rounds = 0
+    if never_give_up:
+        while extra_rounds < max_extra_rounds and not any(succeeded(t) for t in items):
+            extra_rounds += 1
+            # The first round's exceptions still propagate to
+            # art.gather_trajectory_groups' max_exceptions accounting, exactly
+            # as without NGU. In a *retry* round, a crashed rollout is
+            # dropped, the round's other rollouts are kept, and retrying
+            # stops -- repeated failures are more likely a broken tool or
+            # server than bad luck, so more retries would only burn compute.
+            results = await asyncio.gather(
+                *(one() for _ in range(group_size)), return_exceptions=True
+            )
+            failures = [r for r in results if isinstance(r, BaseException)]
+            items.extend(r for r in results if not isinstance(r, BaseException))
+            if failures:
+                logger.warning(
+                    "never-give-up: %d of %d rollouts failed in retry round %d "
+                    "for question %s; stopping retries with %d rollouts",
+                    len(failures),
+                    group_size,
+                    extra_rounds,
+                    question_id,
+                    len(items),
+                    exc_info=failures[0],
+                )
+                break
+    solved_on_retry = extra_rounds > 0 and any(succeeded(t) for t in items)
+    return items, extra_rounds, solved_on_retry
+
+
 async def run_rollout_group(
     model: art.TrainableModel,
     question: Question,
@@ -418,6 +630,9 @@ async def run_rollout_group(
     hallucination_penalty_weight: float = 0.15,
     never_give_up: bool = False,
     ngu_max_extra_rounds: int = 2,
+    evolving_rubrics: bool = False,
+    evolving_rubrics_max: int = 5,
+    evolving_rubrics_log: Path | None = None,
 ) -> art.TrajectoryGroup:
     """Run ``group_size`` rollouts of the same question concurrently --
     one GRPO group.
@@ -464,25 +679,26 @@ async def run_rollout_group(
     cap keeps its all-zero group, which GRPO drops as before. Every
     trajectory in the group carries ``ngu/extra_rounds`` and
     ``ngu/solved_on_retry`` metrics for W&B.
+
+    ``evolving_rubrics`` (default off) applies only to rubric-graded
+    questions -- exact-match questions take the normal path even with it
+    on. Each rollout is first graded on the question's own (persistent)
+    rubrics, which also decides never-give-up retries; once the group is
+    complete, ``JudgeClient.generate_evolving_rubrics`` writes up to
+    ``evolving_rubrics_max`` new criteria from all its rollouts, every
+    rollout is graded on them, zero-variance ones are dropped, and the
+    reward becomes the score on persistent + kept rubrics, with reward
+    shaping applied on top (DR Tulu's RLER, arXiv:2511.19399, scoped down
+    -- see ``rl/rubric_reward.py``). Each group's generated and kept
+    rubrics are appended to ``evolving_rubrics_log`` (JSONL) when given.
     """
     if ngu_max_extra_rounds < 0:
         raise ValueError("ngu_max_extra_rounds must be >= 0")
+    if evolving_rubrics_max < 1:
+        raise ValueError("evolving_rubrics_max must be >= 1")
 
     async def _one_rollout() -> art.Trajectory:
-        if llm_semaphore is None:
-            return await rollout_fn(
-                model,
-                question,
-                judge=judge,
-                tracker=tracker,
-                tool_scope=tool_scope,
-                prefer_compiled=prefer_compiled,
-                penalize_turns=penalize_turns,
-                turn_penalty_weight=turn_penalty_weight,
-                penalize_hallucination=penalize_hallucination,
-                hallucination_penalty_weight=hallucination_penalty_weight,
-            )
-        async with llm_semaphore:
+        async with llm_semaphore or contextlib.nullcontext():
             return await rollout_fn(
                 model,
                 question,
@@ -496,42 +712,49 @@ async def run_rollout_group(
                 hallucination_penalty_weight=hallucination_penalty_weight,
             )
 
-    trajectories: list[Any] = list(
-        await asyncio.gather(*(_one_rollout() for _ in range(group_size)))
-    )
-    if never_give_up:
-        extra_rounds = 0
-        while extra_rounds < ngu_max_extra_rounds and not any(
-            _ngu_success(t) for t in trajectories
-        ):
-            extra_rounds += 1
-            # The first round's exceptions still propagate to
-            # art.gather_trajectory_groups' max_exceptions accounting, exactly
-            # as without NGU. In a *retry* round, a crashed rollout is
-            # dropped, the round's other rollouts are kept, and retrying
-            # stops -- repeated failures are more likely a broken tool or
-            # server than bad luck, so more retries would only burn compute.
-            results = await asyncio.gather(
-                *(_one_rollout() for _ in range(group_size)),
-                return_exceptions=True,
+    async def _one_rubric_rollout() -> _RubricRollout:
+        async with llm_semaphore or contextlib.nullcontext():
+            return await _rubric_rollout(
+                model,
+                question,
+                judge=judge,
+                tracker=tracker,
+                tool_scope=tool_scope,
+                prefer_compiled=prefer_compiled,
+                penalize_hallucination=penalize_hallucination,
             )
-            failures = [r for r in results if isinstance(r, BaseException)]
-            trajectories.extend(r for r in results if not isinstance(r, BaseException))
-            if failures:
-                logger.warning(
-                    "never-give-up: %d of %d rollouts failed in retry round %d "
-                    "for question %s; stopping retries with %d rollouts",
-                    len(failures),
-                    group_size,
-                    extra_rounds,
-                    question.question_id,
-                    len(trajectories),
-                    exc_info=failures[0],
-                )
-                break
-        solved_on_retry = extra_rounds > 0 and any(
-            _ngu_success(t) for t in trajectories
+
+    trajectories: list[Any]
+    if evolving_rubrics and question.rubrics is not None:
+        rubric_rollouts, extra_rounds, solved_on_retry = await _gather_rounds(
+            _one_rubric_rollout,
+            group_size=group_size,
+            succeeded=lambda r: r.persistent_score > 0.0,
+            never_give_up=never_give_up,
+            max_extra_rounds=ngu_max_extra_rounds,
+            question_id=question.question_id,
         )
+        trajectories = await _finalize_with_evolving_rubrics(
+            rubric_rollouts,
+            question,
+            judge=judge,
+            max_new=evolving_rubrics_max,
+            penalize_turns=penalize_turns,
+            turn_penalty_weight=turn_penalty_weight,
+            penalize_hallucination=penalize_hallucination,
+            hallucination_penalty_weight=hallucination_penalty_weight,
+            log_path=evolving_rubrics_log,
+        )
+    else:
+        trajectories, extra_rounds, solved_on_retry = await _gather_rounds(
+            _one_rollout,
+            group_size=group_size,
+            succeeded=_ngu_success,
+            never_give_up=never_give_up,
+            max_extra_rounds=ngu_max_extra_rounds,
+            question_id=question.question_id,
+        )
+    if never_give_up:
         for t in trajectories:
             t.metrics["ngu/extra_rounds"] = float(extra_rounds)
             t.metrics["ngu/solved_on_retry"] = float(solved_on_retry)

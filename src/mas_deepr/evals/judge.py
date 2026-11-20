@@ -69,6 +69,35 @@ should only catch clear, checkable fabrication.
 """.strip()
 
 
+_EVOLVING_RUBRIC_INSTRUCTIONS = """
+You are writing additional grading criteria for a research question, in the
+style of DR Tulu's evolving rubrics. You will be given the question, its
+existing rubric criteria, and several candidate responses written by the same
+research assistant, each with the evidence it gathered and its final answer.
+
+Write between 1 and {max_new} NEW criteria that separate the better candidates
+from the worse ones:
+- "positive" criteria: specific strengths, or relevant facts and insights that
+  some candidates found and others missed, not already covered by the existing
+  criteria.
+- "negative" criteria: undesirable behaviours seen in some candidates, such as
+  claims not supported by the gathered evidence, copying evidence verbatim
+  instead of answering, padding, or ignoring part of the question.
+Each criterion must be one checkable statement about a response, must not
+repeat an existing criterion, and should be met by some candidates but not all.
+
+Respond with ONLY a JSON array in this exact form:
+[{{"type": "positive", "criterion": "..."}}, {{"type": "negative", "criterion": "..."}}]
+No prose before or after the JSON.
+""".strip()
+
+# Per-candidate truncation for the rubric-generation prompt: enough of the
+# evidence and answer to compare candidates, bounded so a 12-rollout
+# never-give-up group still fits comfortably in the judge's context.
+_EVOLVING_FINDINGS_CHARS = 1500
+_EVOLVING_ANSWER_CHARS = 2500
+
+
 class JudgeClient:
     """Wraps a frontier judge model behind the same Agent/telemetry pattern
     used by the research pipeline, so judge calls are logged identically."""
@@ -166,6 +195,45 @@ class JudgeClient:
         out = await self._run(judge_prompt, question_id=question_id)
         return _parse_hallucination_verdict(out)
 
+    async def generate_evolving_rubrics(
+        self,
+        *,
+        prompt: str,
+        rubrics: list[RubricCriterion],
+        candidates: list[tuple[list[str], str]],
+        question_id: str,
+        max_new: int = 5,
+    ) -> list[RubricCriterion]:
+        """DR Tulu's RLER rubric generator (arXiv:2511.19399, Sec. 3.1),
+        scoped down: given the question, its existing ("persistent")
+        rubrics and one GRPO group's rollouts -- each as ``(findings,
+        final_answer)``, the findings being the privileged evidence the
+        policy gathered -- write up to ``max_new`` new criteria that
+        discriminate within the group. Positive criteria get weight +1,
+        negative ones -1 (the paper doesn't publish its weights).
+
+        Same judge client as every other judge call. Returns ``[]`` when
+        the judge's output doesn't parse, so a judge hiccup degrades to
+        persistent-rubric-only scoring rather than failing the rollout.
+        """
+        blocks = []
+        for i, (findings, answer) in enumerate(candidates):
+            evidence = "\n".join(f"- {f}" for f in findings) or "(no findings)"
+            blocks.append(
+                f"Candidate {i}:\nEvidence:\n{evidence[:_EVOLVING_FINDINGS_CHARS]}\n"
+                f"Final answer:\n{answer[:_EVOLVING_ANSWER_CHARS]}"
+            )
+        existing = (
+            "\n".join(f"- {r.criterion}" for r in rubrics) if rubrics else "(none)"
+        )
+        judge_prompt = (
+            f"{_EVOLVING_RUBRIC_INSTRUCTIONS.format(max_new=max_new)}\n\n"
+            f"Research question: {prompt}\n\n"
+            f"Existing criteria:\n{existing}\n\n" + "\n\n".join(blocks)
+        )
+        out = await self._run(judge_prompt, question_id=question_id)
+        return _parse_evolving_rubrics(out, max_new=max_new)
+
 
 def _weighted_rubric_score(
     rubrics: list[RubricCriterion], verdicts: list[bool]
@@ -212,6 +280,45 @@ def _parse_rubric_verdicts(raw: str, *, num_criteria: int) -> list[bool]:
         if isinstance(idx, int) and 0 <= idx < num_criteria:
             verdicts[idx] = bool(item.get("satisfied", False))
     return verdicts
+
+
+def _parse_evolving_rubrics(raw: str, *, max_new: int) -> list[RubricCriterion]:
+    """Parse ``[{"type": "positive"|"negative", "criterion": str}, ...]``
+    into weighted criteria (+1 / -1). Malformed entries, unknown types,
+    empty or duplicate criteria are skipped; at most ``max_new`` are kept;
+    anything unparseable yields ``[]`` (default-safe: no new rubrics)."""
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        return []
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[RubricCriterion] = []
+    seen: set[str] = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type", "")).strip().lower()
+        text = str(item.get("criterion", "")).strip()
+        if kind not in ("positive", "negative") or not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            RubricCriterion(
+                criterion=text,
+                weight=1.0 if kind == "positive" else -1.0,
+                axis=f"evolving_{kind}",
+            )
+        )
+        if len(out) >= max_new:
+            break
+    return out
 
 
 def _parse_hallucination_verdict(raw: str) -> bool:

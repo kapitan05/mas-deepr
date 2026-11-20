@@ -186,6 +186,22 @@ async def main() -> None:
         "3x --group-size rollouts per question).",
     )
     parser.add_argument(
+        "--evolving-rubrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="DR Tulu-style evolving rubrics (arXiv:2511.19399), scoped down: "
+        "for rubric-graded questions the judge writes new criteria from each "
+        "group's rollouts and the reward uses persistent + kept new rubrics. "
+        "Generated rubrics are logged to runs/grpo/<model-name>-evolving-"
+        "rubrics.jsonl. Off by default -- see rl/rollout.py::run_rollout_group.",
+    )
+    parser.add_argument(
+        "--evolving-rubrics-max",
+        type=int,
+        default=5,
+        help="Max new rubrics generated per group (DR Tulu's K_max = 5).",
+    )
+    parser.add_argument(
         "--r2-sync",
         action="store_true",
         help="When the run finishes, upload its output folder plus the W&B "
@@ -195,6 +211,8 @@ async def main() -> None:
     args = parser.parse_args()
     if args.ngu_max_extra_rounds < 0:
         raise SystemExit("--ngu-max-extra-rounds must be >= 0")
+    if args.evolving_rubrics_max < 1:
+        raise SystemExit("--evolving-rubrics-max must be >= 1")
 
     configure_logging()
     settings = get_settings()
@@ -262,6 +280,8 @@ async def main() -> None:
             "hallucination_penalty_weight": args.hallucination_penalty_weight,
             "never_give_up": args.never_give_up,
             "ngu_max_extra_rounds": args.ngu_max_extra_rounds,
+            "evolving_rubrics": args.evolving_rubrics,
+            "evolving_rubrics_max": args.evolving_rubrics_max,
         }
     )
     backend = _make_backend(args.backend)
@@ -279,6 +299,11 @@ async def main() -> None:
     # across questions (art.gather_trajectory_groups runs every group
     # concurrently). See Settings.grpo_llm_concurrency's docstring.
     llm_semaphore = asyncio.Semaphore(settings.grpo_llm_concurrency)
+    evolving_rubrics_log = (
+        settings.runs_dir / "grpo" / f"{args.model_name}-evolving-rubrics.jsonl"
+        if args.evolving_rubrics
+        else None
+    )
     pool_cycle = itertools.cycle(questions)
     all_rows: list[list[Any]] = []
 
@@ -300,6 +325,9 @@ async def main() -> None:
                 hallucination_penalty_weight=args.hallucination_penalty_weight,
                 never_give_up=args.never_give_up,
                 ngu_max_extra_rounds=args.ngu_max_extra_rounds,
+                evolving_rubrics=args.evolving_rubrics,
+                evolving_rubrics_max=args.evolving_rubrics_max,
+                evolving_rubrics_log=evolving_rubrics_log,
             )
             for q in batch
         ]

@@ -9,6 +9,7 @@ from mas_deepr.data.schema import RubricCriterion
 from mas_deepr.evals.judge import JudgeClient
 from mas_deepr.rl.rubric_reward import (
     apply_reward_shaping,
+    combine_with_evolving_rubrics,
     group_advantages,
     prune_zero_variance_rubrics,
     score_rollout_group,
@@ -172,3 +173,57 @@ def test_apply_reward_shaping_clamped_at_zero_not_negative() -> None:
         hallucination_penalty_weight=0.15,
     )
     assert shaped == 0.0
+
+
+def _criterion(text: str, weight: float) -> RubricCriterion:
+    return RubricCriterion(criterion=text, weight=weight, axis="a")
+
+
+def test_combine_with_evolving_rubrics_prunes_zero_variance_and_rescores() -> None:
+    persistent = [_criterion("p0", 2.0)]
+    evolving = [
+        _criterion("all pass", 1.0),  # zero variance -> pruned
+        _criterion("splits", 1.0),  # kept
+        _criterion("all fail", -1.0),  # zero variance -> pruned
+    ]
+    kept, scores = combine_with_evolving_rubrics(
+        persistent=persistent,
+        persistent_verdicts=[[True], [True]],
+        evolving=evolving,
+        evolving_verdicts=[[True, True, False], [True, False, False]],
+    )
+    assert [r.criterion for r in kept] == ["splits"]
+    # (2 + 1) / 3 vs 2 / 3 -- denominator is persistent + kept positive weights
+    assert scores == pytest.approx([1.0, 2.0 / 3.0])
+
+
+def test_combine_with_evolving_rubrics_negative_rubric_subtracts() -> None:
+    kept, scores = combine_with_evolving_rubrics(
+        persistent=[_criterion("p0", 1.0), _criterion("p1", 1.0)],
+        persistent_verdicts=[[True, True], [True, True]],
+        evolving=[_criterion("bad habit", -1.0)],
+        evolving_verdicts=[[True], [False]],
+    )
+    assert len(kept) == 1
+    assert scores == pytest.approx([0.5, 1.0])
+
+
+def test_combine_with_evolving_rubrics_nothing_new_keeps_persistent_scores() -> None:
+    kept, scores = combine_with_evolving_rubrics(
+        persistent=[_criterion("p0", 1.0), _criterion("p1", 3.0)],
+        persistent_verdicts=[[True, False], [False, True]],
+        evolving=[],
+        evolving_verdicts=[[], []],
+    )
+    assert kept == []
+    assert scores == pytest.approx([0.25, 0.75])
+
+
+def test_combine_with_evolving_rubrics_rejects_misaligned_groups() -> None:
+    with pytest.raises(ValueError):
+        combine_with_evolving_rubrics(
+            persistent=[_criterion("p0", 1.0)],
+            persistent_verdicts=[[True], [False]],
+            evolving=[],
+            evolving_verdicts=[[]],
+        )
