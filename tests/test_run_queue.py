@@ -287,3 +287,14 @@ def test_invalid_run_tag_rejected() -> None:
     assert not rq.valid_run_tag("v 2") and not rq.valid_run_tag("../x")
     with pytest.raises(SystemExit):
         rq.main(["--dry-run", "--run-tag", "a/b"])
+
+
+def test_queue_refuses_to_start_without_the_art_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[str] = []
+    monkeypatch.setattr(rq, "art_patch_check", lambda: (False, "ART NOT patched"))
+    monkeypatch.setattr(rq, "start_mcp_server", lambda *a, **k: started.append("mcp"))
+    with pytest.raises(SystemExit, match="refusing to start"):
+        rq.main(["--stages", "s1-baseline", "--no-dspy"])
+    assert started == []  # stopped before anything was launched

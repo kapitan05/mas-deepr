@@ -103,6 +103,13 @@ uv pip install --python "$PY" \
 print('art', art.__version__ if hasattr(art, '__version__') else '?', \
 '| torch', torch.__version__, '| wandb', wandb.__version__)"
 
+# --- 4b. ART training-memory patch ---------------------------------------------
+# Entropy without autograd in ART's log-prob pass (only logged, never part of
+# the loss) -- without it the training step doesn't fit the L4. Refuses and
+# fails the setup if the installed ART isn't the expected 0.5.20 code.
+say "ART entropy patch"
+"$PY" scripts/vm/patch_art_entropy.py
+
 # --- 5. Chromium for crawl4ai (the fetch_page tool) ----------------------------
 say "Chromium for crawl4ai"
 if ! "$PROJECT_DIR/.venv-gpu/bin/crawl4ai-setup"; then

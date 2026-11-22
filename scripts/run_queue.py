@@ -375,6 +375,21 @@ def start_mcp_server(
     raise SystemExit(f"MCP server didn't come up within {timeout_s:.0f}s")
 
 
+def art_patch_check() -> tuple[bool, str]:
+    """Whether the installed ART carries scripts/vm/patch_art_entropy.py's
+    patch (without it every training step runs out of GPU memory on the
+    L4). Loaded by path: scripts/ isn't a package."""
+    import importlib.util
+
+    path = PROJECT_ROOT / "scripts" / "vm" / "patch_art_entropy.py"
+    spec = importlib.util.spec_from_file_location("patch_art_entropy", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result: tuple[bool, str] = module.check()
+    return result
+
+
 def power_off() -> None:
     """Stop this machine: RunPod pods via runpodctl, anything else via
     ``shutdown`` (on Google Cloud that stops the VM; its disk is kept)."""
@@ -477,6 +492,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"[{job.job_id}] {' '.join(argv_ or ['(nothing left to train)'])}")
         return 0
+
+    patched, message = art_patch_check()
+    print(message, flush=True)
+    if not patched:
+        raise SystemExit("refusing to start: " + message)
 
     state = QueueState(queue_dir / f"state-{cfg.tag}.json")
     if args.retry_failed:
