@@ -111,6 +111,9 @@ class QueueConfig:
     dspy_auto: str = "medium"
     python: str = sys.executable
     run_tag: str = ""  # e.g. "v2": new model names, W&B runs and queue state
+    # Crashed training restarts from its last checkpoint up to this many
+    # times per stage (see run_plan).
+    train_retries: int = 3
 
     @property
     def tag(self) -> str:
@@ -308,35 +311,83 @@ def run_plan(
         if missing:
             outcomes[job.job_id] = f"skipped (needs {', '.join(missing)})"
             continue
-        argv = job.argv
-        if job.stage is not None:
-            done_steps = latest_checkpoint_step(art_models_dir, cfg.model(job.stage))
-            maybe = train_argv(cfg, job.stage, done_steps=done_steps)
-            if maybe is None:  # trained to the target already
+        log_path = queue_dir / "logs" / f"{job.job_id.replace(':', '_')}.log"
+        if job.stage is None:
+            code, minutes = _run_job(job.argv, log_path, runner)
+            _record(state, status_log, outcomes, job.job_id, code, minutes)
+            continue
+        # Training: resume from the newest checkpoint, and restart a crashed
+        # run (ART's vLLM add-on occasionally kills its engine mid-run --
+        # "prompt policy token spans overlap", 2026-11-24, s3 step 45 and s4
+        # step 38). A restart only resumes; it never retrains a step. Give
+        # up after cfg.train_retries restarts, or after two attempts in a
+        # row that saved no new checkpoint (a failure that repeats at once,
+        # e.g. out of memory on the first step, isn't worth retrying).
+        attempt = 0
+        stalled = 0
+        while True:
+            name = cfg.model(job.stage)
+            before = latest_checkpoint_step(art_models_dir, name)
+            argv = train_argv(cfg, job.stage, done_steps=before)
+            if argv is None:  # trained to the target already
                 state.set(job.job_id, "done")
                 outcomes[job.job_id] = "done (checkpoints complete)"
-                continue
-            argv = maybe
-        started = time.monotonic()
-        print(f"\n### [{job.job_id}] {' '.join(argv)}", flush=True)
-        code = runner(argv, queue_dir / "logs" / f"{job.job_id.replace(':', '_')}.log")
-        status = "done" if code == 0 else "failed"
-        state.set(job.job_id, status)
-        outcomes[job.job_id] = status if code == 0 else f"failed (exit {code})"
-        with status_log.open("a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "job": job.job_id,
-                        "status": status,
-                        "exit_code": code,
-                        "minutes": round((time.monotonic() - started) / 60, 1),
-                        "finished": datetime.now(UTC).isoformat(),
-                    }
-                )
-                + "\n"
+                break
+            code, minutes = _run_job(argv, log_path, runner)
+            after = latest_checkpoint_step(art_models_dir, name)
+            _record(
+                state, status_log, outcomes, job.job_id, code, minutes,
+                attempt=attempt, steps=(before, after),
+            )  # fmt: skip
+            if code == 0:
+                break
+            stalled = stalled + 1 if after <= before else 0
+            if attempt >= cfg.train_retries or stalled >= 2:
+                break
+            attempt += 1
+            print(
+                f"### [{job.job_id}] failed at checkpoint {after}; restarting "
+                f"(retry {attempt}/{cfg.train_retries})",
+                flush=True,
             )
     return outcomes
+
+
+def _run_job(argv: list[str], log_path: Path, runner: Runner) -> tuple[int, float]:
+    started = time.monotonic()
+    print(f"\n### [{log_path.stem}] {' '.join(argv)}", flush=True)
+    code = runner(argv, log_path)
+    return code, round((time.monotonic() - started) / 60, 1)
+
+
+def _record(
+    state: QueueState,
+    status_log: Path,
+    outcomes: dict[str, str],
+    job_id: str,
+    code: int,
+    minutes: float,
+    *,
+    attempt: int | None = None,
+    steps: tuple[int, int] | None = None,
+) -> None:
+    """Persist one finished attempt: queue state, outcome, status.jsonl."""
+    status = "done" if code == 0 else "failed"
+    state.set(job_id, status)
+    outcomes[job_id] = status if code == 0 else f"failed (exit {code})"
+    line: dict[str, object] = {
+        "job": job_id,
+        "status": status,
+        "exit_code": code,
+        "minutes": minutes,
+        "finished": datetime.now(UTC).isoformat(),
+    }
+    if attempt is not None:
+        line["attempt"] = attempt
+    if steps is not None:
+        line["checkpoint_before"], line["checkpoint_after"] = steps
+    with status_log.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(line) + "\n")
 
 
 def port_open(host: str, port: int) -> bool:
@@ -440,6 +491,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Watchdog: power off after this long without any queue output.",
     )
     parser.add_argument(
+        "--train-retries",
+        type=int,
+        default=3,
+        help="Restart a crashed training stage from its last checkpoint up to "
+        "this many times (stops early if two attempts in a row save no new "
+        "checkpoint). 0 = no automatic restart.",
+    )
+    parser.add_argument(
         "--retry-failed",
         action="store_true",
         help="Rerun jobs that failed in an earlier invocation.",
@@ -452,6 +511,8 @@ def main(argv: list[str] | None = None) -> int:
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
     for s in stages:
         stage_train_flags(s)  # validates the name
+    if args.train_retries < 0:
+        raise SystemExit("--train-retries must be >= 0")
     if not valid_run_tag(args.run_tag):
         raise SystemExit("--run-tag may contain only letters, digits, '-' and '_'")
     cfg = QueueConfig(
@@ -462,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         dspy=not args.no_dspy,
         dspy_auto=args.dspy_auto,
         run_tag=args.run_tag,
+        train_retries=args.train_retries,
     )
 
     os.environ.setdefault("ART_MEGATRON_CACHE_ROOT", str(ART_CACHE_DIR))

@@ -298,3 +298,98 @@ def test_queue_refuses_to_start_without_the_art_patch(
     with pytest.raises(SystemExit, match="refusing to start"):
         rq.main(["--stages", "s1-baseline", "--no-dspy"])
     assert started == []  # stopped before anything was launched
+
+
+def _crashing_trainer(
+    models: Path, name: str, crash_after: list[int]
+) -> tuple[Any, list[list[str]]]:
+    """Fake runner: each training attempt trains from --skip-batches and
+    'crashes' (exit 1) after reaching the next step in ``crash_after``, else
+    finishes; saves a checkpoint folder per step like ART does."""
+    calls: list[list[str]] = []
+    plan = list(crash_after)
+
+    def runner(argv: list[str], log_path: Path) -> int:
+        calls.append(argv)
+        if "train_grpo.py" not in argv[1]:
+            return 0
+        start = int(argv[argv.index("--skip-batches") + 1])
+        end = start + int(argv[argv.index("--num-steps") + 1])
+        stop = plan.pop(0) if plan else end
+        for step in range(start + 1, min(stop, end) + 1):
+            (models / name / "checkpoints" / f"{step:04d}").mkdir(parents=True)
+        return 1 if stop < end else 0
+
+    return runner, calls
+
+
+def _run_with(tmp_path: Path, cfg: Any, runner: Any) -> dict[str, str]:
+    return rq.run_plan(
+        rq.build_plan(cfg, project="p"),
+        cfg,
+        state=rq.QueueState(tmp_path / "state.json"),
+        queue_dir=tmp_path,
+        art_models_dir=tmp_path / "models",
+        runner=runner,
+    )
+
+
+def test_crashed_training_restarts_and_resumes(tmp_path: Path) -> None:
+    cfg = rq.QueueConfig(python="py", stages=["s3-ngu"], dspy=False, run_tag="v4")
+    runner, calls = _crashing_trainer(
+        tmp_path / "models", cfg.model("s3-ngu"), [45, 80]
+    )
+    outcomes = _run_with(tmp_path, cfg, runner)
+    assert outcomes["s3-ngu:train"] == "done"
+    assert outcomes["s3-ngu:eval"] == "done"  # eval ran after the recovery
+    trains = [c for c in calls if "train_grpo.py" in c[1]]
+    assert [c[c.index("--skip-batches") + 1] for c in trains] == ["0", "45", "80"]
+    assert [c[c.index("--num-steps") + 1] for c in trains] == ["100", "55", "20"]
+    lines = [
+        json.loads(x)
+        for x in (tmp_path / "status.jsonl").read_text().splitlines()
+        if "train" in x
+    ]
+    assert [
+        (x["attempt"], x["checkpoint_before"], x["checkpoint_after"]) for x in lines
+    ] == [
+        (0, 0, 45),
+        (1, 45, 80),
+        (2, 80, 100),
+    ]
+
+
+def test_retries_are_capped(tmp_path: Path) -> None:
+    cfg = rq.QueueConfig(python="py", stages=["s3-ngu"], dspy=False, train_retries=2)
+    runner, calls = _crashing_trainer(
+        tmp_path / "models", cfg.model("s3-ngu"), [10, 20, 30, 40]
+    )
+    outcomes = _run_with(tmp_path, cfg, runner)
+    assert outcomes["s3-ngu:train"] == "failed (exit 1)"
+    assert outcomes["s3-ngu:eval"].startswith("skipped")
+    assert len([c for c in calls if "train_grpo.py" in c[1]]) == 3  # 1 + 2 retries
+
+
+def test_no_progress_stops_retrying(tmp_path: Path) -> None:
+    """A failure that repeats immediately (e.g. out of memory on the first
+    step) gives up after two attempts that saved nothing."""
+    cfg = rq.QueueConfig(python="py", stages=["s1-baseline"], dspy=False)
+    runner, calls = _crashing_trainer(
+        tmp_path / "models", cfg.model("s1-baseline"), [0, 0, 0, 0]
+    )
+    outcomes = _run_with(tmp_path, cfg, runner)
+    assert outcomes["s1-baseline:train"] == "failed (exit 1)"
+    assert len([c for c in calls if "train_grpo.py" in c[1]]) == 2
+
+
+def test_train_retries_zero_disables_restarts(tmp_path: Path) -> None:
+    cfg = rq.QueueConfig(
+        python="py", stages=["s1-baseline"], dspy=False, train_retries=0
+    )
+    runner, calls = _crashing_trainer(
+        tmp_path / "models", cfg.model("s1-baseline"), [30]
+    )
+    _run_with(tmp_path, cfg, runner)
+    assert len([c for c in calls if "train_grpo.py" in c[1]]) == 1
+    with pytest.raises(SystemExit):
+        rq.main(["--dry-run", "--train-retries", "-1"])
