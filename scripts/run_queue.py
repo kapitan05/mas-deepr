@@ -38,6 +38,7 @@ Usage (on the VM, inside the project folder, with .venv-gpu):
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -341,6 +342,9 @@ def run_plan(
             )  # fmt: skip
             if code == 0:
                 break
+            saved = save_crashed_vllm_log(art_models_dir, name, attempt)
+            if saved is not None:
+                print(f"### [{job.job_id}] vLLM log kept as {saved}", flush=True)
             stalled = stalled + 1 if after <= before else 0
             if attempt >= cfg.train_retries or stalled >= 2:
                 break
@@ -351,6 +355,24 @@ def run_plan(
                 flush=True,
             )
     return outcomes
+
+
+def save_crashed_vllm_log(art_models_dir: Path, name: str, attempt: int) -> Path | None:
+    """Copy model ``name``'s vLLM log after a failed training attempt.
+
+    ART rewrites ``logs/vllm-runtime.log`` every time it starts vLLM, so a
+    restart would otherwise erase the cause of the crash. The copy sits
+    next to it as ``vllm-runtime.log.crash-<UTC time>-attempt<N>`` (so
+    ``vllm-runtime.log*`` finds every one) and is uploaded with the
+    model's folder. Returns the copy's path, or ``None`` if there was no
+    log (e.g. the job failed before vLLM started)."""
+    src = art_models_dir / name / "logs" / "vllm-runtime.log"
+    if not src.is_file():
+        return None
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    dest = src.with_name(f"{src.name}.crash-{stamp}-attempt{attempt}")
+    shutil.copy2(src, dest)
+    return dest
 
 
 def _run_job(argv: list[str], log_path: Path, runner: Runner) -> tuple[int, float]:

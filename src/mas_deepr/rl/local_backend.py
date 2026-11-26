@@ -43,12 +43,29 @@ Training-step memory (``backend.train()``; found on the first real runs,
   entropy over the 151,936-token vocabulary one chunk at a time, briefly
   holding several ``chunk x vocab`` fp32 tensors (~0.6 GB each at 1024).
   Smaller chunks only change memory and speed, not the computed values.
+
+vLLM scheduling (found on the s3/s4 runs, 2026-11-24/25):
+
+- vLLM 0.25 schedules asynchronously by default: it plans the next engine
+  step before it has processed the previous step's output. ART's vLLM
+  add-on (``art_vllm_runtime/policy_spans.py``, identical in
+  openpipe-art 0.5.20 and 0.5.24) records which policy produced each
+  prompt token, chunk by chunk, and resets that record when vLLM preempts
+  a request (KV cache full). With async scheduling a chunk computed before
+  the preemption can arrive after the reset, so the re-prefilled prompt
+  overlaps it and the engine dies with "prompt policy token spans
+  overlap". Long never-give-up rollouts filled the KV cache (90-99 % just
+  before the crashes), so s3/s4 crashed every 1-40 steps.
+  ``async_scheduling=False`` processes each step's output before
+  scheduling the next, which closes that window. It changes only the
+  order of vLLM's work (somewhat slower rollouts), not which tokens are
+  generated or trained on.
 """
 
 import argparse
 import re
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     import art
@@ -88,14 +105,19 @@ def local_model_configs(
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     if lora_rank < 1 or lora_alpha < 1:
         raise ValueError("lora_rank and lora_alpha must be >= 1")
+    # A plain dict, not art.dev.EngineArgs(...): that TypedDict has no
+    # ``async_scheduling`` key, although ART passes every engine arg through
+    # to vLLM (as ``--no-async-scheduling``). See the module docstring.
+    engine_args: dict[str, Any] = {
+        "max_model_len": max_seq_length,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "async_scheduling": False,
+    }
     internal = art.dev.InternalModelConfig(
         init_args=art.dev.InitArgs(
             max_seq_length=max_seq_length, load_in_4bit=load_in_4bit
         ),
-        engine_args=art.dev.EngineArgs(
-            max_model_len=max_seq_length,
-            gpu_memory_utilization=gpu_memory_utilization,
-        ),
+        engine_args=cast("art.dev.EngineArgs", engine_args),
     )
     lora = art.dev.LoRAConfig(rank=lora_rank, alpha=lora_alpha)
     return internal, lora

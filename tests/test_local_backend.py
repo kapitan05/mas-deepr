@@ -23,6 +23,15 @@ def test_local_model_configs_defaults_are_bf16_32k_rank16() -> None:
     assert lora == {"rank": 16, "alpha": 32}
 
 
+def test_local_model_configs_turn_off_async_scheduling() -> None:
+    """ART's policy-span bookkeeping crashes vLLM under async scheduling
+    when a request is preempted (see rl/local_backend.py's docstring)."""
+    from mas_deepr.rl.local_backend import local_model_configs
+
+    internal, _ = local_model_configs()
+    assert internal["engine_args"]["async_scheduling"] is False
+
+
 def test_local_model_configs_overrides_and_validation() -> None:
     from mas_deepr.rl.local_backend import local_model_configs
 
@@ -58,6 +67,7 @@ def test_local_model_configs_feed_arts_own_config_builder() -> None:
     assert cfg["init_args"]["load_in_4bit"] is False
     assert cfg["init_args"]["max_seq_length"] == 32_768
     assert cfg["engine_args"]["max_model_len"] == 32_768
+    assert cfg["engine_args"]["async_scheduling"] is False
     assert cfg["lora_config"]["rank"] == 16
 
 

@@ -393,3 +393,30 @@ def test_train_retries_zero_disables_restarts(tmp_path: Path) -> None:
     assert len([c for c in calls if "train_grpo.py" in c[1]]) == 1
     with pytest.raises(SystemExit):
         rq.main(["--dry-run", "--train-retries", "-1"])
+
+
+def test_failed_attempts_keep_their_vllm_log(tmp_path: Path) -> None:
+    """Each crashed attempt's vLLM log is copied before the restart
+    overwrites it; a successful attempt leaves no copy."""
+    cfg = rq.QueueConfig(python="py", stages=["s3-ngu"], dspy=False, run_tag="v4")
+    name = cfg.model("s3-ngu")
+    trainer, _ = _crashing_trainer(tmp_path / "models", name, [45, 80])
+    log = tmp_path / "models" / name / "logs" / "vllm-runtime.log"
+    attempts = iter(range(10))
+
+    def runner(argv: list[str], log_path: Path) -> int:
+        if "train_grpo.py" in argv[1]:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(f"vllm run {next(attempts)}")  # ART rewrites it
+        return int(trainer(argv, log_path))
+
+    outcomes = _run_with(tmp_path, cfg, runner)
+    assert outcomes["s3-ngu:train"] == "done"
+    copies = sorted(log.parent.glob("vllm-runtime.log.crash-*"))
+    assert [p.name.rsplit("-", 1)[1] for p in copies] == ["attempt0", "attempt1"]
+    assert [p.read_text() for p in copies] == ["vllm run 0", "vllm run 1"]
+    assert log.read_text() == "vllm run 2"
+
+
+def test_save_crashed_vllm_log_without_a_log(tmp_path: Path) -> None:
+    assert rq.save_crashed_vllm_log(tmp_path, "m", 0) is None
