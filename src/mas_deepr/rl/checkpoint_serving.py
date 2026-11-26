@@ -13,7 +13,9 @@ and the scripts' own unit tests import those scripts without it.
 """
 
 import os
-from dataclasses import dataclass
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from mas_deepr.config import ModelSpec
@@ -56,6 +58,12 @@ class ServedCheckpoint:
     backend: Any
     step: int
     inference_name: str
+    # Holds the adapter lease when an older local checkpoint is served (see
+    # serve_checkpoint); close() releases it.
+    leases: AsyncExitStack = field(default_factory=AsyncExitStack)
+
+    async def close(self) -> None:
+        await self.leases.aclose()
 
 
 async def serve_checkpoint(
@@ -75,6 +83,13 @@ async def serve_checkpoint(
     latest checkpoint. Also sets the API-key environment variable the
     checkpoint's ``ModelSpec`` reads -- a local vLLM server may have no
     key, but the OpenAI client still needs a non-empty one.
+
+    Locally, ART starts vLLM with only the *latest* checkpoint loaded, so
+    any other step (0 = the untrained LoRA, or a kept intermediate step)
+    is loaded into the running server through ART's
+    ``exact_adapter_lease``; otherwise every request for ``<name>@<step>``
+    gets a 404 (the 2026-11-26 step-0 baseline eval). Call
+    ``ServedCheckpoint.close()`` when done to release it.
     """
     import art
 
@@ -99,7 +114,11 @@ async def serve_checkpoint(
     else:
         raise ValueError(f"unknown backend {backend_kind!r}")
     await model.register(backend)
-    resolved = step if step is not None else await model.get_step()
+    latest = await model.get_step()
+    resolved = step if step is not None else latest
+    leases = AsyncExitStack()
+    if backend_kind == "local" and resolved != latest:
+        await _lease_local_step(model, backend, resolved, leases)
     if model.inference_api_key:
         os.environ[CHECKPOINT_API_KEY_ENV] = model.inference_api_key
     elif backend_kind == "local":
@@ -109,7 +128,35 @@ async def serve_checkpoint(
         backend=backend,
         step=resolved,
         inference_name=model.get_inference_name(step=resolved),
+        leases=leases,
     )
+
+
+async def _lease_local_step(
+    model: Any, backend: Any, step: int, leases: AsyncExitStack
+) -> None:
+    """Load checkpoint ``step`` into the local vLLM server for as long as
+    ``leases`` stays open. Fails fast, before any question is asked, when
+    that step isn't on disk (training keeps every 25th step plus the
+    latest -- see rl/local_backend.py::prune_checkpoints)."""
+    from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
+
+    # LocalBackend keeps its .art root in ``_path`` (ART's own
+    # exact_adapter_lease builds the same path from it).
+    model_dir = get_model_dir(model=model, art_path=backend._path)
+    checkpoint = Path(get_step_checkpoint_dir(model_dir, step))
+    if not checkpoint.is_dir():
+        parent = checkpoint.parent
+        kept: list[int] = []
+        if parent.is_dir():
+            kept = sorted(
+                int(p.name) for p in parent.iterdir() if p.is_dir() and p.name.isdigit()
+            )
+        raise ValueError(
+            f"checkpoint step {step} of {model.name!r} is not on disk "
+            f"({checkpoint}); steps on disk: {kept}"
+        )
+    await leases.enter_async_context(backend.exact_adapter_lease(model, step))
 
 
 def register_checkpoint_spec(

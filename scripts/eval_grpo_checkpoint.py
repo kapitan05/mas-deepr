@@ -175,6 +175,7 @@ async def main() -> None:
         summary_df, rme.get_settings(), milestone, disabled=args.no_wandb
     )
     r2.finish([out_dir])
+    await served.close()
 
 
 if __name__ == "__main__":
